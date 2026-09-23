@@ -48,6 +48,7 @@ add_executable(gizmo
     src/chat/handler.cpp
     src/util/proc_status.cpp
     src/server/server.cpp
+    src/ui/model_picker.cpp
 )
 
 target_include_directories(gizmo PRIVATE

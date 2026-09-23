@@ -1,5 +1,6 @@
 #include "cli_parser.hpp"
 #include "inference_engine.hpp"
+#include "model_picker.hpp"
 #include "proc_status.hpp"
 #include "server.hpp"
 
@@ -410,11 +411,15 @@ int main(int argc, char* argv[]) {
         }
 
         case gizmo::CommandType::Serve: {
-            if (options.model.empty()) {
-                std::cerr << "Error: --model required for serve\n";
-                return 1;
+            std::string model_path = options.model;
+            if (model_path.empty()) {
+                model_path = gizmo::pick_model_interactive();
+                if (model_path.empty()) {
+                    std::cerr << "No model selected. Use -m <path> to specify one.\n";
+                    return 1;
+                }
             }
-            return do_serve(options.model, options.host, options.port,
+            return do_serve(model_path, options.host, options.port,
                             options.resident_layers, options.no_evict, options.row_size);
         }
 

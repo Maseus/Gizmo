@@ -63,6 +63,9 @@ gizmo run -m /path/to/model.gguf -p "Hello, world" --measure-ram
 # Start an OpenAI-compatible server on port 11434
 gizmo serve -m /path/to/model.gguf
 
+# Or let gizmo scan your Ollama / LM Studio models and show a picker
+gizmo serve
+
 # Bind to a specific address / port
 gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080
 
