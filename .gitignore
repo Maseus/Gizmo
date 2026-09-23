@@ -1,0 +1,72 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Compiled binaries and libraries
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+gizmo
+!gizmo/
+
+# Object files and debug symbols
+*.o
+*.obj
+*.pdb
+*.ilk
+*.dSYM/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# clangd / language server cache
+.cache/
+.clangd/
+
+# Claude local workspace
+.claude/
+
+# Models and downloaded data
+models/
+*.gguf
+*.bin
+*.safetensors
+
+# Local environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python artifacts (if any tooling is added)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test outputs
+*.log
+*.tmp
