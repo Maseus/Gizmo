@@ -9,6 +9,7 @@ enum class CommandType {
     Run,
     Chat,
     Bench,
+    Serve,
     List,
     Download,
     Info,
@@ -31,6 +32,8 @@ struct CliOptions {
     bool prefill_only = false;    // bench: sharded prefill in isolation, no decode
     bool no_evict = false;        // bench: skip madvise(MADV_PAGEOUT) for comparator
     int32_t row_size = 1;         // Phase 9: blocks per cgraph (default 1 = per-block)
+    std::string host = "0.0.0.0"; // gizmo serve: bind address
+    int32_t port = 11434;           // gizmo serve: default Ollama-compatible port
 };
 
 class CliParser {

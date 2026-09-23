@@ -1,6 +1,7 @@
 #include "cli_parser.hpp"
 #include "inference_engine.hpp"
 #include "proc_status.hpp"
+#include "server.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -328,6 +329,31 @@ static int do_bench(const std::string& model_path, bool prefill_only, int32_t re
     return 0;
 }
 
+static int do_serve(const std::string& model_path, const std::string& host, int32_t port, int32_t /*resident_layers*/, bool /*no_evict*/, int32_t /*row_size*/) {
+    // Snapshot VmRSS before model load so we can show real deltas.
+    const size_t rss_before_load = gizmo::read_vm_rss_bytes();
+
+    gizmo::InferenceEngine engine;
+    if (!engine.initialize(model_path, /*layer_shard_lazy=*/false)) {
+        std::cerr << "Failed to initialize inference engine\n";
+        return 1;
+    }
+
+    // NOTE: server mode currently uses the un-sharded (full-model) path.
+    // The per-block sharded engine crashes during scheduler reservation on
+    // this llama.cpp commit; fixing it is the next sharded-engine phase.
+    // For now, `gizmo serve` loads the whole model into RAM, which is the
+    // same behavior as `ollama serve` for most users.
+
+    const size_t rss_after_load = gizmo::read_vm_rss_bytes();
+    std::cout << "VmRSS after model load: "
+              << (rss_after_load / (1024 * 1024)) << " MB"
+              << "  (delta: +" << ((rss_after_load - rss_before_load) / (1024 * 1024)) << " MB)\n";
+
+    gizmo::Server server(&engine, model_path);
+    return server.run(host, port) ? 0 : 1;
+}
+
 int main(int argc, char* argv[]) {
     gizmo::CliParser parser;
     auto options = parser.parse(argc, argv);
@@ -381,6 +407,15 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             return do_bench(options.model, options.prefill_only, options.resident_layers, options.no_evict, options.row_size);
+        }
+
+        case gizmo::CommandType::Serve: {
+            if (options.model.empty()) {
+                std::cerr << "Error: --model required for serve\n";
+                return 1;
+            }
+            return do_serve(options.model, options.host, options.port,
+                            options.resident_layers, options.no_evict, options.row_size);
         }
 
         case gizmo::CommandType::Download: {

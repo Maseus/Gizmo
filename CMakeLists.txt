@@ -47,6 +47,7 @@ add_executable(gizmo
     src/inference/engine.cpp
     src/chat/handler.cpp
     src/util/proc_status.cpp
+    src/server/server.cpp
 )
 
 target_include_directories(gizmo PRIVATE
@@ -57,6 +58,16 @@ target_include_directories(gizmo PRIVATE
 if(EXISTS "${CMAKE_SOURCE_DIR}/llama.cpp/CMakeLists.txt")
     target_link_libraries(gizmo PRIVATE
         llama
+    )
+    # The HTTP server uses cpp-httplib and nlohmann/json vendored inside
+    # the llama.cpp submodule. Make their headers available and compile the
+    # httplib implementation file.
+    target_include_directories(gizmo PRIVATE
+        ${CMAKE_SOURCE_DIR}/llama.cpp/vendor/cpp-httplib
+        ${CMAKE_SOURCE_DIR}/llama.cpp/vendor/nlohmann
+    )
+    target_sources(gizmo PRIVATE
+        ${CMAKE_SOURCE_DIR}/llama.cpp/vendor/cpp-httplib/httplib.cpp
     )
 else()
     # Stub build - no llama.cpp yet

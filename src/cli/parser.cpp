@@ -8,6 +8,7 @@ CommandType CliParser::parse_command(const std::string& cmd) const {
     if (cmd == "run") return CommandType::Run;
     if (cmd == "chat") return CommandType::Chat;
     if (cmd == "bench") return CommandType::Bench;
+    if (cmd == "serve") return CommandType::Serve;
     if (cmd == "list") return CommandType::List;
     if (cmd == "download") return CommandType::Download;
     if (cmd == "info") return CommandType::Info;
@@ -64,6 +65,10 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
             // blocks into one ggml_cgraph. K=1 is the per-block
             // baseline; larger K reduces scheduler overhead.
             if (i + 1 < argc) options.row_size = std::atoi(argv[++i]);
+        } else if (arg == "--host") {
+            if (i + 1 < argc) options.host = argv[++i];
+        } else if (arg == "--port") {
+            if (i + 1 < argc) options.port = std::atoi(argv[++i]);
         }
     }
 }
@@ -91,6 +96,7 @@ Commands:
   run       Run a model with a prompt
   chat      Start interactive chat session
   bench     Run memory/performance benchmark across prompt lengths
+  serve     Start HTTP server (Ollama-compatible, OpenAI endpoints)
   list      List available models
   download  Download a model from URL
   info      Show system and model info
@@ -106,6 +112,8 @@ Options:
       --prefill-only            bench: sharded prefill in isolation, no decode
       --no-evict                bench: disable per-block MADV_PAGEOUT (full model resident)
   -K, --row-size <K>           Phase 9: chain K blocks per cgraph (default: 1)
+      --host <addr>             gizmo serve: bind address (default: 0.0.0.0)
+      --port <n>                gizmo serve: port (default: 11434)
   -u, --url <url>               URL for download command
   -p, --prompt <text>           Prompt text for run command
   -i, --interactive             Enable interactive mode

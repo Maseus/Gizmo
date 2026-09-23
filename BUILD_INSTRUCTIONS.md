@@ -57,6 +57,25 @@ gizmo run -m /path/to/model.gguf -p "Hello, world"
 gizmo run -m /path/to/model.gguf -p "Hello, world" --measure-ram
 ```
 
+## Serve
+
+```bash
+# Start an OpenAI-compatible server on port 11434
+gizmo serve -m /path/to/model.gguf
+
+# Bind to a specific address / port
+gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080
+
+# From another terminal or machine
+curl http://localhost:11434/v1/models
+curl -X POST http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":128}'
+```
+
+The server prints its listening address and any local-network IPs so you
+can connect from another device on the same LAN.
+
 ## Ollama model paths
 
 If you already have the model in Ollama, the GGUF blob is under

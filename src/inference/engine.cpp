@@ -364,6 +364,84 @@ std::string InferenceEngine::generate(const std::string& prompt, const Inference
     return result;
 }
 
+int InferenceEngine::generate_stream(
+    const std::string& prompt,
+    const InferenceConfig& config,
+    std::function<bool(const std::string& token)> callback
+) {
+    if (!initialized_ || llama_context_ == nullptr) {
+        return -1;
+    }
+
+    const struct llama_vocab* vocab = llama_model_get_vocab(llama_model_);
+
+    std::vector<llama_token> tokens(512);
+    int32_t n_tokens = llama_tokenize(
+        vocab,
+        prompt.c_str(),
+        prompt.size(),
+        tokens.data(),
+        tokens.size(),
+        true,
+        true
+    );
+
+    if (n_tokens < 0) {
+        std::cerr << "Error: Failed to tokenize prompt\n";
+        return -1;
+    }
+
+    struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    struct llama_sampler* sampler = llama_sampler_chain_init(sparams);
+
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(42));
+
+    size_t sharded_rss = 0;
+    size_t sharded_hwm = 0;
+    if (do_prefill(llama_context_, (const llama_model*)llama_model_,
+                   sharded_sched_, tokens.data(), n_tokens,
+                   sharded_evict_weights_, sharded_resident_layers_,
+                   sharded_row_size_,
+                   &sharded_rss, &sharded_hwm) != 0) {
+        llama_sampler_free(sampler);
+        return -1;
+    }
+    last_sharded_prefill_rss_ = sharded_rss;
+    last_sharded_prefill_hwm_ = sharded_hwm;
+
+    int generated = 0;
+    int32_t n_predict = config.max_tokens;
+    while (generated < n_predict) {
+        llama_token new_token_id = llama_sampler_sample(sampler, llama_context_, -1);
+
+        if (llama_vocab_is_eog(vocab, new_token_id)) {
+            break;
+        }
+
+        char piece[256];
+        int32_t piece_len = llama_token_to_piece(vocab, new_token_id, piece, sizeof(piece), 0, false);
+        if (piece_len > 0) {
+            piece[piece_len] = '\0';
+            if (!callback(std::string(piece))) {
+                break;
+            }
+        }
+
+        if (llama_decode(llama_context_, llama_batch_get_one(&new_token_id, 1)) != 0) {
+            std::cerr << "Error: Failed to decode generated token\n";
+            break;
+        }
+
+        ++generated;
+    }
+
+    llama_sampler_free(sampler);
+    return generated;
+}
+
 TokenResult InferenceEngine::generate_token(const std::string& context, const InferenceConfig& config) {
     TokenResult result;
     if (!initialized_ || llama_context_ == nullptr) {

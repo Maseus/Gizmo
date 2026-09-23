@@ -4,6 +4,7 @@
 #include <string>
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -62,6 +63,15 @@ public:
 
     // Generate text from a prompt
     std::string generate(const std::string& prompt, const InferenceConfig& config);
+
+    // Generate text from a prompt, calling callback for each decoded token.
+    // If callback returns false, generation stops early. Returns the total
+    // number of generated tokens. Used by the HTTP server for SSE streaming.
+    int generate_stream(
+        const std::string& prompt,
+        const InferenceConfig& config,
+        std::function<bool(const std::string& token)> callback
+    );
 
     // Generate a single token
     TokenResult generate_token(const std::string& context, const InferenceConfig& config);

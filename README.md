@@ -27,12 +27,19 @@ gizmo --help
 gizmo info
 gizmo run -m /path/to/model.gguf -p "Hello"
 gizmo run -m /path/to/model.gguf -p "Hello" --measure-ram
+
+# Start an OpenAI-compatible server (default port 11434, like Ollama)
+gizmo serve -m /path/to/model.gguf
+gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080
 ```
 
 ## What Gizmo does
 
-- Wraps llama.cpp's library API with a small CLI (`run`, `chat`, `list`,
-  `download`, `info`).
+- Wraps llama.cpp's library API with a small CLI (`run`, `chat`, `serve`,
+  `bench`, `list`, `download`, `info`).
+- Exposes an **OpenAI-compatible HTTP server** via `gizmo serve`, with
+  endpoints for `/v1/models`, `/v1/chat/completions`, and `/v1/completions`,
+  plus streaming (`stream: true`) SSE responses.
 - Reports **real** memory usage (`/proc/self/status:VmRSS` / `VmHWM`) at
   model load, during generation, and at end-of-run. Use `--measure-ram`
   to print periodic VmRSS samples to stderr while generation is running.
@@ -68,6 +75,7 @@ when the custom forward pass lands, the per-block range map is ready.
 | `run`       | Run a model with a single prompt |
 | `chat`      | Start interactive chat session |
 | `bench`     | Run memory/performance benchmarks |
+| `serve`     | Start OpenAI-compatible HTTP server |
 | `info`      | Show system memory info |
 | `list`      | *(stub)* List downloaded models |
 | `download`  | *(stub)* Download a model from URL |
@@ -83,6 +91,8 @@ when the custom forward pass lands, the per-block range map is ready.
   default; placeholder for the future sharded engine)
 - `--measure-ram` — print VmRSS to stderr every
   `--measure-interval-ms` ms during `run`/`chat`
+- `--host <addr>` — `serve` bind address (default `0.0.0.0`)
+- `--port <n>` — `serve` port (default `11434`)
 - `-p, --prompt <text>` — prompt for `run`
 - `-u, --url <url>` — URL for `download`
 - `-i, --interactive` — interactive mode
@@ -114,7 +124,8 @@ gizmo-dev/
 │   ├── layer_manager.hpp
 │   ├── model_manager.hpp
 │   ├── chat_handler.hpp
-│   └── proc_status.hpp
+│   ├── proc_status.hpp
+│   └── server.hpp
 ├── src/
 │   ├── main.cpp
 │   ├── cli/parser.cpp
@@ -122,7 +133,8 @@ gizmo-dev/
 │   ├── model/manager.cpp
 │   ├── inference/engine.cpp
 │   ├── chat/handler.cpp
-│   └── util/proc_status.cpp
+│   ├── util/proc_status.cpp
+│   └── server/server.cpp
 ├── llama.cpp/                # Submodule (apply patches/llama.cpp-gizmo.patch)
 ├── patches/                  # Patches required on top of the llama.cpp submodule
 ├── build/gizmo               # Static binary (generated)
