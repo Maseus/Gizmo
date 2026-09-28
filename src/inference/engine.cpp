@@ -1,10 +1,12 @@
 #include "inference_engine.hpp"
 #include "proc_status.hpp"
+#include "tokenizer.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <vector>
 #include <unistd.h>
 
@@ -27,43 +29,6 @@ namespace {
 std::atomic<int>& backend_refcount() {
     static std::atomic<int> count{0};
     return count;
-}
-
-// Two-pass tokenization helper: returns the exact token vector for `text`,
-// resizing automatically when the fixed buffer would overflow. Returns an
-// empty vector and sets *out_n negative on error.
-std::vector<llama_token> tokenize_text(
-    const llama_vocab* vocab,
-    const std::string& text,
-    bool add_special,
-    bool parse_special,
-    int32_t* out_n = nullptr
-) {
-    std::vector<llama_token> tokens;
-    if (out_n != nullptr) *out_n = 0;
-
-    int32_t n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
-                               nullptr, 0, add_special, parse_special);
-    if (n == 0) {
-        if (out_n != nullptr) *out_n = 0;
-        return tokens;
-    }
-    if (n < 0) {
-        // llama_tokenize returns the negative required count when the output
-        // buffer (including a zero-length nullptr buffer) is too small.
-        n = -n;
-    }
-
-    tokens.resize(static_cast<size_t>(n));
-    int32_t n_check = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
-                                    tokens.data(), n, add_special, parse_special);
-    if (n_check < 0) {
-        if (out_n != nullptr) *out_n = n_check;
-        tokens.clear();
-        return tokens;
-    }
-    if (out_n != nullptr) *out_n = n_check;
-    return tokens;
 }
 
 // The sharded per-block engine is currently validated for the pure-attention
@@ -330,6 +295,14 @@ static int do_prefill(
 ) {
     const int n_vocab = (int)llama_vocab_n_tokens(llama_model_get_vocab(model));
 
+    // Reject prompts that do not fit in the KV cache before any decode work.
+    const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(ctx));
+    if (n_tokens >= n_ctx) {
+        std::cerr << "Error: Prompt too long (" << n_tokens
+                  << " tokens, context size " << n_ctx << ")\n";
+        return -1;
+    }
+
     if (sched != nullptr) {
         // Phase 7: allocate KV cache cells for the full prompt before
         // running the sharded prefill. The per-block graphs use
@@ -541,6 +514,13 @@ bool InferenceEngine::generate_stream(
         return false;
     }
 
+    const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(llama_context_));
+    if (n_tokens >= n_ctx) {
+        std::cerr << "Error: Prompt is too long (" << n_tokens
+                  << " tokens, context size " << n_ctx << ")\n";
+        return false;
+    }
+
     // Honor per-request context-size requests by rebuilding the context if
     // the requested size differs from the current one. Callers typically
     // reset the KV cache before generation, so this is safe.
@@ -562,16 +542,24 @@ bool InferenceEngine::generate_stream(
         }
     }
 
+    // Build the sampler chain in the order llama.cpp expects:
+    //   penalties -> temperature -> top_k -> top_p -> dist.
+    // Applying top_k/top_p before penalties or temperature leaves the
+    // repeat-penalty and temperature scaling operating on a truncated
+    // distribution, which harms sampling quality.
     struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     struct llama_sampler* sampler = llama_sampler_chain_init(sparams);
 
     const int32_t n_vocab = static_cast<int32_t>(llama_vocab_n_tokens(vocab));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 64,
         config.repeat_penalty > 0.0f ? config.repeat_penalty : 1.0f, 0.0f, 0.0f));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(config.seed >= 0 ? config.seed : 42));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
+    const uint32_t seed = config.seed >= 0
+        ? static_cast<uint32_t>(config.seed)
+        : static_cast<uint32_t>(std::random_device{}());
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
 
     // Prefill. Sharded path runs the per-block engine, which writes
     // K/V directly into the KV cache. Non-sharded path runs the
@@ -622,21 +610,7 @@ bool InferenceEngine::generate_stream(
             break;
         }
 
-        std::string token_text;
-        char piece[256];
-        int32_t piece_len = llama_token_to_piece(vocab, new_token_id, piece, sizeof(piece), 0, false);
-        if (piece_len < 0) {
-            // Buffer too small: resize and retry.
-            std::vector<char> big_piece(-piece_len + 1, '\0');
-            piece_len = llama_token_to_piece(vocab, new_token_id, big_piece.data(),
-                                              static_cast<int32_t>(big_piece.size()), 0, false);
-            if (piece_len > 0) {
-                token_text.assign(big_piece.data(), static_cast<size_t>(piece_len));
-            }
-        } else if (piece_len > 0) {
-            piece[piece_len] = '\0';
-            token_text.assign(piece, static_cast<size_t>(piece_len));
-        }
+        std::string token_text = token_to_piece(vocab, new_token_id, /*special=*/false);
 
         if (!token_text.empty()) {
             generated_text += token_text;
@@ -758,6 +732,13 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
         return result;
     }
 
+    const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(llama_context_));
+    if (n_tokens >= n_ctx) {
+        std::cerr << "Error: Context is too long (" << n_tokens
+                  << " tokens, context size " << n_ctx << ")\n";
+        return result;
+    }
+
     if (do_prefill(llama_context_, (const llama_model*)llama_model_,
                    sharded_sched_, tokens.data(), n_tokens,
                    sharded_evict_weights_, sharded_resident_layers_,
@@ -768,17 +749,26 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
         return result;
     }
 
-    struct llama_sampler* sampler = llama_sampler_init_temp(config.temperature);
+    // Use the same sampler chain as generate_stream so single-token callers
+    // get consistent top_k/top_p/penalties/temperature behavior.
+    struct llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+    struct llama_sampler* sampler = llama_sampler_chain_init(sparams);
+    const int32_t n_vocab = static_cast<int32_t>(llama_vocab_n_tokens(vocab));
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(n_vocab, 64,
+        config.repeat_penalty > 0.0f ? config.repeat_penalty : 1.0f, 0.0f, 0.0f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
+    const uint32_t seed = config.seed >= 0
+        ? static_cast<uint32_t>(config.seed)
+        : static_cast<uint32_t>(std::random_device{}());
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+
     llama_token new_token = llama_sampler_sample(sampler, llama_context_, -1);
+    llama_sampler_free(sampler);
 
     result.token_id = new_token;
-    char piece[256];
-    int32_t piece_len = llama_token_to_piece(vocab, new_token, piece, sizeof(piece), 0, false);
-    if (piece_len > 0) {
-        piece[piece_len] = '\0';
-        result.text = piece;
-    }
-    llama_sampler_free(sampler);
+    result.text = token_to_piece(vocab, new_token, /*special=*/false);
 
     return result;
 }

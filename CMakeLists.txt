@@ -45,6 +45,7 @@ add_executable(gizmo
     src/model/manager.cpp
     src/inference/engine.cpp
     src/inference/chat_template.cpp
+    src/inference/tokenizer.cpp
     src/util/proc_status.cpp
     src/server/server.cpp
     src/ui/tui.cpp

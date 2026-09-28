@@ -19,7 +19,7 @@ struct InferenceConfig {
     float top_p = 0.95f;
     int32_t top_k = 40;
     float repeat_penalty = 1.1f;
-    int32_t seed = -1;  // -1 = random seed from llama_sampler_init_dist
+    int32_t seed = -1;  // -1 = use a random seed from std::random_device()
     std::vector<std::string> stop;  // optional stop strings/sequences
 };
 

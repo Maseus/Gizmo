@@ -2,6 +2,7 @@
 
 #include "chat_template.hpp"
 #include "inference_engine.hpp"
+#include "tokenizer.hpp"
 #include "llama.h"
 #include "ggml-backend.h"
 
@@ -103,20 +104,10 @@ int count_tokens(const llama_model* model, const std::string& text) {
     if (!vocab) {
         return 0;
     }
-    int32_t n_needed = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
-                                       nullptr, 0,
-                                       /*add_special=*/true, /*parse_special=*/true);
-    if (n_needed == 0) {
-        return 0;
-    }
-    if (n_needed < 0) {
-        n_needed = -n_needed;
-    }
-    std::vector<llama_token> tokens(static_cast<size_t>(n_needed));
-    const int n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
-                                 tokens.data(), n_needed,
-                                 /*add_special=*/true, /*parse_special=*/true);
-    return n < 0 ? 0 : n;
+    int32_t n = 0;
+    (void)gizmo::tokenize_text(vocab, text,
+                               /*add_special=*/true, /*parse_special=*/true, &n);
+    return n > 0 ? n : 0;
 }
 
 // Generate a short random request id. Thread-safe so multiple httplib
@@ -504,18 +495,38 @@ InferenceConfig parse_inference_config(const json& request_json) {
     InferenceConfig config;
     if (request_json.contains("max_tokens")) {
         config.max_tokens = request_json["max_tokens"].get<int32_t>();
+        if (config.max_tokens <= 0) {
+            config.max_tokens = 16;
+        }
     }
     if (request_json.contains("temperature")) {
         config.temperature = request_json["temperature"].get<float>();
+        if (config.temperature < 0.0f) {
+            config.temperature = 0.0f;
+        }
     }
     if (request_json.contains("top_p")) {
         config.top_p = request_json["top_p"].get<float>();
+        if (config.top_p < 0.0f) {
+            config.top_p = 0.0f;
+        } else if (config.top_p > 1.0f) {
+            config.top_p = 1.0f;
+        }
     }
     if (request_json.contains("top_k")) {
         config.top_k = request_json["top_k"].get<int32_t>();
+        if (config.top_k < 0) {
+            config.top_k = 0;
+        }
     }
     if (request_json.contains("seed")) {
         config.seed = request_json["seed"].get<int32_t>();
+    }
+    if (request_json.contains("repeat_penalty")) {
+        config.repeat_penalty = request_json["repeat_penalty"].get<float>();
+        if (config.repeat_penalty <= 0.0f) {
+            config.repeat_penalty = 1.0f;
+        }
     }
     if (request_json.contains("stop")) {
         const auto& stop_field = request_json["stop"];

@@ -6,6 +6,7 @@
 #include "model_manager.hpp"
 #include "proc_status.hpp"
 #include "server/server.hpp"
+#include "tokenizer.hpp"
 #include "tui.hpp"
 #include "util/string.hpp"
 
@@ -61,28 +62,20 @@ std::string build_prompt_for_token_count(
         repeated += prompt_template;
     }
 
-    std::vector<llama_token> tokens(repeated.size() + 16);
-    int n = llama_tokenize(vocab, repeated.c_str(), repeated.size(),
-                           tokens.data(), tokens.size(),
-                           /*add_special=*/true, /*parse_special=*/true);
-    if (n < 0) {
+    int32_t n = 0;
+    std::vector<llama_token> tokens = gizmo::tokenize_text(
+        vocab, repeated, /*add_special=*/true, /*parse_special=*/true, &n);
+    if (n <= 0) {
         return "";
     }
     const int use_n = std::min(target_tokens, n);
 
     // Detokenize the first use_n tokens back to a string so it can
     // be passed to the text-based generate() API.
-    std::string prompt_str;
-    std::vector<char> buf(64);
-    for (int i = 0; i < use_n; ++i) {
-        int piece_len = llama_token_to_piece(vocab, tokens[i], buf.data(),
-                                             buf.size(), /*lstrip=*/0,
-                                             /*special=*/true);
-        if (piece_len > 0) {
-            prompt_str.append(buf.data(), piece_len);
-        }
-    }
-    return prompt_str;
+    return gizmo::tokens_to_string(
+        vocab,
+        std::vector<llama_token>(tokens.begin(), tokens.begin() + use_n),
+        /*special=*/true);
 }
 
 // Run a single (N, sharded?) measurement against the engine.
@@ -127,18 +120,9 @@ bench_row_t run_one_bench(
     // to a string, then pass that to generate. Slight rounding
     // error possible but good enough for memory benchmarks.
     // (Phase 7+ can add a direct tokens-passthrough API.)
-    std::string prompt_str;
-    {
-        const struct llama_vocab * vocab =
-            llama_model_get_vocab(engine.raw_model());
-        std::vector<char> buf(64);
-        for (int i = 0; i < n_tokens; ++i) {
-            int n = llama_token_to_piece(vocab, tokens[i], buf.data(),
-                                         buf.size(), /*lstrip=*/0,
-                                         /*special=*/true);
-            if (n > 0) prompt_str.append(buf.data(), n);
-        }
-    }
+    std::vector<llama_token> use_tokens(tokens.begin(), tokens.begin() + n_tokens);
+    const std::string prompt_str = gizmo::tokens_to_string(
+        llama_model_get_vocab(engine.raw_model()), use_tokens, /*special=*/true);
     if (sharded && prefill_only) {
         // Sharded-prefill-only path: skip the un-sharded prefill
         // and the decode loop. Measures only the sharded prefill
@@ -356,11 +340,10 @@ static int do_validate(
             // using the engine vocab; the value is the same for baseline
             // and sharded so either branch can fill it.
             {
-                const struct llama_vocab* vocab =
-                    llama_model_get_vocab(engine.raw_model());
-                std::vector<llama_token> toks(prompt.size() + 16);
-                int n = llama_tokenize(vocab, prompt.c_str(), prompt.size(),
-                                       toks.data(), toks.size(), true, true);
+                int32_t n = 0;
+                (void)gizmo::tokenize_text(
+                    llama_model_get_vocab(engine.raw_model()), prompt,
+                    /*add_special=*/true, /*parse_special=*/true, &n);
                 r.n_tokens = n > 0 ? n : 0;
             }
             if (is_baseline) {
@@ -632,11 +615,10 @@ static int do_chat(
         std::cout << response;
 
         // Count generated tokens for speed reporting.
-        std::vector<llama_token> response_toks(response.size() + 16);
-        int n_response_tokens = llama_tokenize(
-            vocab, response.c_str(), response.size(),
-            response_toks.data(), response_toks.size(),
-            /*add_special=*/false, /*parse_special=*/false);
+        int32_t n_response_tokens = 0;
+        (void)gizmo::tokenize_text(
+            vocab, response,
+            /*add_special=*/false, /*parse_special=*/false, &n_response_tokens);
         if (n_response_tokens < 0) n_response_tokens = 0;
 
         const double wall_s = std::chrono::duration<double>(t1 - t0).count();
@@ -704,10 +686,9 @@ static int do_sweep(
     }
 
     // Actual token count of the generated prompt.
-    std::vector<llama_token> prompt_toks(prompt.size() + 16);
-    int actual_prefill = llama_tokenize(vocab, prompt.c_str(), prompt.size(),
-                                        prompt_toks.data(), prompt_toks.size(),
-                                        /*add_special=*/true, /*parse_special=*/true);
+    int32_t actual_prefill = 0;
+    (void)gizmo::tokenize_text(vocab, prompt,
+                               /*add_special=*/true, /*parse_special=*/true, &actual_prefill);
     if (actual_prefill < 0) actual_prefill = 0;
 
     // Deterministic generation config.
@@ -948,16 +929,14 @@ static int do_bench(const std::string& model_path, bool prefill_only, int32_t re
     const struct llama_vocab * vocab =
         llama_model_get_vocab(engine.raw_model());
 
-    std::vector<llama_token> tokens(prompt_repeated.size() + 16);
-    int n = llama_tokenize(vocab, prompt_repeated.c_str(),
-                           prompt_repeated.size(),
-                           tokens.data(), tokens.size(),
-                           /*add_special=*/true, /*parse_special=*/true);
-    if (n < 0) {
+    int32_t n = 0;
+    std::vector<llama_token> tokens = gizmo::tokenize_text(
+        vocab, prompt_repeated,
+        /*add_special=*/true, /*parse_special=*/true, &n);
+    if (n <= 0) {
         std::cerr << "Failed to tokenize bench prompt\n";
         return 1;
     }
-    tokens.resize(n);
     std::cout << "[bench] tokenized " << n << " tokens of repeated prompt\n";
 
     // Sharded scheduler must be enabled to use the sharded path.
