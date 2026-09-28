@@ -110,7 +110,6 @@ private:
     // small queue-depth cap prevents unbounded backlog when subagents or
     // multiple clients call concurrently.
     mutable std::mutex engine_mutex_;
-    std::condition_variable engine_cv_;
     std::atomic<int> active_generations_{0};
     std::atomic<int> queued_generations_{0};
     static constexpr int kMaxQueueDepth = 8;

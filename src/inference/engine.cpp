@@ -328,71 +328,88 @@ static int do_prefill(
     bool                  verbose = false,
     bool                  progress = false
 ) {
-    const int32_t n_batch_max = llama_n_batch(ctx) > 0 ? llama_n_batch(ctx) : 512;
     const int n_vocab = (int)llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     if (sched != nullptr) {
-        // Chunk the prompt so each sharded prefill step stays within
-        // the context's batch limit. Only the final chunk produces the
-        // logits that seed the decode loop.
-        for (int32_t offset = 0; offset < n_tokens; offset += n_batch_max) {
-            const int32_t chunk = std::min(n_batch_max, n_tokens - offset);
-            llama_memory_context_t mctx =
-                llama_kv_cache_init_for_batch(ctx, chunk);
-            if (mctx == nullptr) {
-                std::cerr << "Error: llama_kv_cache_init_for_batch failed\n";
-                return -1;
-            }
-            // Commit the slot allocation BEFORE run_multi_block so
-            // get_k()/get_v() see the correct n_kv for this chunk.
-            mctx->apply();
-            multi_block_result_t res = run_multi_block(
-                model, sched, tokens + offset, chunk, evict_weights,
-                resident_layers, row_size, mctx,
-                /*pos_first=*/offset, verbose, progress, "prefill");
-            if (res.final_logits.empty()) {
-                std::cerr << "Error: sharded prefill failed\n";
-                llama_memory_context_free(mctx);
-                return -1;
-            }
-            const bool is_last = (offset + chunk) >= n_tokens;
-            if (is_last) {
-                // Capture VmRSS/HWM at the end of the sharded prefill.
-                if (out_sharded_rss != nullptr) {
-                    *out_sharded_rss = gizmo::read_vm_rss_bytes();
-                }
-                if (out_sharded_hwm != nullptr) {
-                    *out_sharded_hwm = gizmo::read_vm_hwm_bytes();
-                }
-                const size_t last_col = (size_t)(chunk - 1) * n_vocab;
-                int best_id = 0;
-                float best_val = res.final_logits[last_col];
-                for (int i = 1; i < n_vocab; ++i) {
-                    const float v = res.final_logits[last_col + i];
-                    if (v > best_val) {
-                        best_val = v;
-                        best_id = i;
-                    }
-                }
-                if (verbose) {
-                    std::cout << "[sharded] prefill done; argmax=" << best_id
-                              << " (logit=" << best_val << ")\n";
-                }
-                float* logits_buf = llama_get_logits(ctx);
-                if (logits_buf != nullptr) {
-                    std::memcpy(logits_buf, res.final_logits.data() + last_col,
-                                (size_t)n_vocab * sizeof(float));
-                }
-            }
-            llama_memory_context_free(mctx);
+        // Phase 7: allocate KV cache cells for the full prompt before
+        // running the sharded prefill. The per-block graphs use
+        // mctx->cpy_k/cpy_v to write K/V into the cache and
+        // mctx->get_k/get_v to read them back for attention. After the
+        // sharded prefill completes, the cache holds the K/V values,
+        // so the un-sharded decode loop can pick up without a second
+        // prefill.
+        llama_memory_context_t mctx =
+            llama_kv_cache_init_for_batch(ctx, n_tokens);
+        if (mctx == nullptr) {
+            std::cerr << "Error: llama_kv_cache_init_for_batch failed\n";
+            return -1;
         }
-        // Sharded path populated the KV cache; skip un-sharded prefill.
+        // Commit the slot allocation BEFORE run_multi_block. This
+        // updates llama_kv_cache_context::n_kv to the per-ubatch
+        // padded slot size, so get_k()/get_v() return views with
+        // n_kv matching the kq_mask width. Without this the views
+        // span the full cache and flash_attn reads uninitialised
+        // K/V at positions past n_tokens.
+        mctx->apply();
+        multi_block_result_t res = run_multi_block(
+            model, sched, tokens, n_tokens, evict_weights,
+            resident_layers, row_size, mctx,
+            /*pos_first=*/0, verbose, progress, "prefill");
+        if (res.final_logits.empty()) {
+            std::cerr << "Error: sharded prefill failed\n";
+            llama_memory_context_free(mctx);
+            return -1;
+        }
+        // Capture VmRSS/HWM at the end of the sharded prefill. The
+        // bench reports these as the steady-state cost of the sharded
+        // path with no un-sharded re-fault (Phase 7).
+        if (out_sharded_rss != nullptr) {
+            *out_sharded_rss = gizmo::read_vm_rss_bytes();
+        }
+        if (out_sharded_hwm != nullptr) {
+            *out_sharded_hwm = gizmo::read_vm_hwm_bytes();
+        }
+        // The sharded result IS used downstream in Phase 7 — the
+        // logits feed llama_sampler_sample in the decode loop (we
+        // no longer run the un-sharded prefill below). We log the
+        // argmax so it can be compared against the un-sharded
+        // path.
+        const size_t last_col = (size_t)(n_tokens - 1) * n_vocab;
+        int best_id = 0;
+        float best_val = res.final_logits[last_col];
+        for (int i = 1; i < n_vocab; ++i) {
+            const float v = res.final_logits[last_col + i];
+            if (v > best_val) {
+                best_val = v;
+                best_id = i;
+            }
+        }
+        if (verbose) {
+            std::cout << "[sharded] prefill done; argmax=" << best_id
+                      << " (logit=" << best_val << ")\n";
+        }
+        // Phase 7: the sharded prefill populated the KV cache. Skip
+        // the un-sharded prefill to avoid re-faulting the model.
         prefill_unsharded = false;
+        // Copy sharded prefill's last-token logits into
+        // llama_context's output buffer; llama_sampler_sample reads
+        // from there during the decode loop.
+        float * logits_buf = llama_get_logits(ctx);
+        if (logits_buf != nullptr) {
+            std::memcpy(logits_buf, res.final_logits.data() + last_col,
+                        (size_t)n_vocab * sizeof(float));
+        }
+        llama_memory_context_free(mctx);
     }
     if (!prefill_unsharded) {
+        // Sharded-prefill-only path OR Phase 7's "sharded wrote K/V
+        // already, skip the un-sharded prefill" path. Either way,
+        // KV cache is populated and the decode loop can run.
         return 0;
     }
-    // Un-sharded path: prefill in chunks that fit the batch limit.
+    // Un-sharded path: prefill in chunks that fit the context's batch
+    // limit. llama_decode asserts when a batch exceeds n_batch.
+    const int32_t n_batch_max = llama_n_batch(ctx) > 0 ? llama_n_batch(ctx) : 512;
     for (int32_t offset = 0; offset < n_tokens; offset += n_batch_max) {
         const int32_t chunk = std::min(n_batch_max, n_tokens - offset);
         if (llama_decode(ctx, llama_batch_get_one(tokens + offset, chunk)) != 0) {
@@ -401,7 +418,7 @@ static int do_prefill(
         }
     }
     {
-        float* logits = llama_get_logits(ctx);
+        float * logits = llama_get_logits(ctx);
         if (logits != nullptr) {
             int best_id = 0;
             float best_val = logits[0];
@@ -580,12 +597,14 @@ bool InferenceEngine::generate_stream(
     int32_t n_cur = 0;
     int32_t n_past = n_tokens;  // KV cache already holds the prompt
     std::string generated_text;
+    bool cancelled = false;
 
     while (n_cur < n_predict) {
         if (should_cancel && should_cancel()) {
             if (verbose_) {
                 std::cout << "Generation cancelled by caller\n";
             }
+            cancelled = true;
             break;
         }
 
@@ -603,11 +622,23 @@ bool InferenceEngine::generate_stream(
             break;
         }
 
+        std::string token_text;
         char piece[256];
         int32_t piece_len = llama_token_to_piece(vocab, new_token_id, piece, sizeof(piece), 0, false);
-        if (piece_len > 0) {
+        if (piece_len < 0) {
+            // Buffer too small: resize and retry.
+            std::vector<char> big_piece(-piece_len + 1, '\0');
+            piece_len = llama_token_to_piece(vocab, new_token_id, big_piece.data(),
+                                              static_cast<int32_t>(big_piece.size()), 0, false);
+            if (piece_len > 0) {
+                token_text.assign(big_piece.data(), static_cast<size_t>(piece_len));
+            }
+        } else if (piece_len > 0) {
             piece[piece_len] = '\0';
-            std::string token_text(piece);
+            token_text.assign(piece, static_cast<size_t>(piece_len));
+        }
+
+        if (!token_text.empty()) {
             generated_text += token_text;
             if (callback) {
                 callback(token_text, new_token_id);
@@ -648,15 +679,17 @@ bool InferenceEngine::generate_stream(
                 llama_sampler_free(sampler);
                 return false;
             }
-            const int n_vocab = (int)llama_vocab_n_tokens(llama_model_get_vocab(llama_model_));
-            float * logits = llama_get_logits(llama_context_);
-            if (logits != nullptr) {
-                int best_id = 0;
-                float best_val = logits[0];
-                for (int i = 1; i < n_vocab; ++i) {
-                    if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
-                }
-                if (verbose_) {
+            if (verbose_) {
+                float * logits = llama_get_logits(llama_context_);
+                if (logits != nullptr) {
+                    int best_id = 0;
+                    float best_val = logits[0];
+                    for (int i = 1; i < n_vocab; ++i) {
+                        if (logits[i] > best_val) {
+                            best_val = logits[i];
+                            best_id = i;
+                        }
+                    }
                     std::cout << "[un-sharded] decode token done; argmax=" << best_id
                               << " (logit=" << best_val << ")\n";
                 }
@@ -673,7 +706,7 @@ bool InferenceEngine::generate_stream(
     }
 
     llama_sampler_free(sampler);
-    return true;
+    return !cancelled;
 }
 
 std::string InferenceEngine::generate(const std::string& prompt, const InferenceConfig& config, bool quiet) {

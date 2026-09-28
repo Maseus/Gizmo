@@ -1,5 +1,6 @@
 #include "server/server.hpp"
 
+#include "chat_template.hpp"
 #include "inference_engine.hpp"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -93,7 +94,7 @@ using json = nlohmann::json;
 namespace {
 
 // Count tokens in a UTF-8 text string using the loaded model's vocabulary.
-// Returns 0 if the engine/model is not ready.
+// Returns 0 if the engine/model is not ready or tokenization fails.
 int count_tokens(const llama_model* model, const std::string& text) {
     if (!model || text.empty()) {
         return 0;
@@ -102,16 +103,28 @@ int count_tokens(const llama_model* model, const std::string& text) {
     if (!vocab) {
         return 0;
     }
-    std::vector<llama_token> tokens(text.size() + 16, 0);
+    int32_t n_needed = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
+                                       nullptr, 0,
+                                       /*add_special=*/true, /*parse_special=*/true);
+    if (n_needed == 0) {
+        return 0;
+    }
+    if (n_needed < 0) {
+        n_needed = -n_needed;
+    }
+    std::vector<llama_token> tokens(static_cast<size_t>(n_needed));
     const int n = llama_tokenize(vocab, text.c_str(), static_cast<int32_t>(text.size()),
-                                 tokens.data(), static_cast<int32_t>(tokens.size()),
+                                 tokens.data(), n_needed,
                                  /*add_special=*/true, /*parse_special=*/true);
     return n < 0 ? 0 : n;
 }
 
-// Generate a short random request id.
+// Generate a short random request id. Thread-safe so multiple httplib
+// worker threads can create ids concurrently without corrupting the RNG.
 std::string make_request_id() {
+    static std::mutex rng_mutex;
     static std::mt19937_64 rng(std::random_device{}());
+    std::lock_guard<std::mutex> lock(rng_mutex);
     std::ostringstream oss;
     oss << "req_" << std::hex << (rng() & 0xffffffffffff);
     return oss.str();
@@ -482,32 +495,7 @@ void HttpServer::handle_models(const httplib::Request& req, httplib::Response& r
 std::string HttpServer::format_chat_messages(
     const std::vector<std::pair<std::string, std::string>>& messages,
     bool add_assistant) {
-    if (!engine_.raw_model() || messages.empty()) {
-        return "";
-    }
-
-    const char* tmpl = llama_model_chat_template(engine_.raw_model(), /*name=*/nullptr);
-    std::vector<llama_chat_message> chat;
-    chat.reserve(messages.size());
-    for (const auto& m : messages) {
-        chat.push_back({m.first.c_str(), m.second.c_str()});
-    }
-
-    std::string buf(4096, '\0');
-    int32_t needed = llama_chat_apply_template(
-        tmpl, chat.data(), chat.size(), add_assistant, buf.data(), static_cast<int32_t>(buf.size()));
-    if (needed < 0) {
-        return "";
-    }
-    if (needed > static_cast<int32_t>(buf.size())) {
-        buf.resize(static_cast<size_t>(needed) + 1);
-        needed = llama_chat_apply_template(
-            tmpl, chat.data(), chat.size(), add_assistant, buf.data(), static_cast<int32_t>(buf.size()));
-    }
-    if (needed <= 0) {
-        return "";
-    }
-    return std::string(buf.data(), static_cast<size_t>(needed));
+    return gizmo::apply_chat_template(engine_.raw_model(), messages, add_assistant);
 }
 
 namespace {
@@ -723,10 +711,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             };
 
             bool ok = engine_.generate_stream(prompt, config,
-                [queue, &first, model_id, &completion_tokens](const std::string& token_text, int32_t) {
+                [queue, &first, model_id, request_id, &completion_tokens](const std::string& token_text, int32_t) {
                     ++completion_tokens;
                     json chunk;
-                    chunk["id"] = "chatcmpl-" + model_id;
+                    chunk["id"] = "chatcmpl-" + request_id;
                     chunk["object"] = "chat.completion.chunk";
                     chunk["created"] = static_cast<int64_t>(std::time(nullptr));
                     chunk["model"] = model_id;
@@ -751,7 +739,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
             // Final chunk with finish_reason="stop" (or "error" on failure).
             json final_chunk;
-            final_chunk["id"] = "chatcmpl-" + model_id;
+            final_chunk["id"] = "chatcmpl-" + request_id;
             final_chunk["object"] = "chat.completion.chunk";
             final_chunk["created"] = static_cast<int64_t>(std::time(nullptr));
             final_chunk["model"] = model_id;
