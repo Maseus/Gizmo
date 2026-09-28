@@ -56,7 +56,7 @@ public:
     }
 
     // Returns true if a chunk was popped into `out`. Returns false when
-    // the stream has been closed and the queue is empty.
+    // the stream has been closed/cancelled and the queue is empty.
     bool pop(std::string& out) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this]() { return closed_ || !chunks_.empty(); });
@@ -76,9 +76,26 @@ public:
         cv_.notify_all();
     }
 
+    // Cancel the stream from the consumer side (e.g. client disconnected).
+    // Closes the queue and sets a flag the producer can observe to abort
+    // generation early and release the engine slot.
+    void cancel() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+            cancelled_ = true;
+        }
+        cv_.notify_all();
+    }
+
     bool is_closed() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return closed_;
+    }
+
+    bool is_cancelled() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cancelled_;
     }
 
 private:
@@ -86,6 +103,7 @@ private:
     std::condition_variable cv_;
     std::deque<std::string> chunks_;
     bool closed_ = false;
+    bool cancelled_ = false;
 };
 
 } // namespace
@@ -206,6 +224,13 @@ void HttpServer::start() {
     std::lock_guard<std::mutex> lock(svr_mutex_);
     svr_ = std::make_unique<httplib::Server>();
 
+    // Configure the request worker thread pool. Without this httplib uses
+    // CPPHTTPLIB_THREAD_POOL_COUNT threads regardless of config_.threads.
+    const int32_t worker_threads = config_.threads > 0 ? config_.threads : 4;
+    svr_->new_task_queue = [worker_threads]() {
+        return new httplib::ThreadPool(static_cast<size_t>(worker_threads));
+    };
+
     // Set up routes
     using httplib::Request;
     using httplib::Response;
@@ -292,6 +317,10 @@ void HttpServer::stop() {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    if (log_stream_.is_open()) {
+        log_stream_.flush();
+    }
+
     running_.store(false);
 }
 
@@ -714,11 +743,12 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const auto t0 = std::chrono::steady_clock::now();
             auto timeout = std::chrono::steady_clock::now() +
                            std::chrono::seconds(config_.request_timeout_seconds);
-            // The cancel predicate only sets the generation abort flag. The
-            // worker thread is responsible for emitting the final SSE chunk
-            // and [DONE] so the client always sees a complete stream.
-            auto should_cancel = [this, timeout]() {
-                return stop_requested_.load() || std::chrono::steady_clock::now() > timeout;
+            // The cancel predicate observes server shutdown, the per-request
+            // timeout, and client disconnect (signalled via the queue).
+            auto should_cancel = [this, timeout, queue]() {
+                return stop_requested_.load() ||
+                       std::chrono::steady_clock::now() > timeout ||
+                       queue->is_cancelled();
             };
 
             bool ok = engine_.generate_stream(prompt, config,
@@ -784,9 +814,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         res.set_header("Connection", "keep-alive");
         res.set_chunked_content_provider("text/event-stream",
             [queue](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                // If the client disconnected, cancel generation so the engine
+                // slot is released promptly instead of running to max_tokens.
+                if (!sink.is_writable()) {
+                    queue->cancel();
+                    return false;
+                }
                 std::string chunk;
                 if (queue->pop(chunk)) {
-                    sink.write(chunk.data(), chunk.size());
+                    if (!sink.write(chunk.data(), chunk.size())) {
+                        queue->cancel();
+                        return false;
+                    }
                     // [DONE] signals the end of the stream.
                     if (chunk.find("data: [DONE]") != std::string::npos) {
                         return false;
