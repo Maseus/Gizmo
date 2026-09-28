@@ -5,6 +5,7 @@
 #include "model_discovery.hpp"
 #include "proc_status.hpp"
 #include "terminal_utils.hpp"
+#include "tokenizer.hpp"
 #include "util/string.hpp"
 
 #include "llama.h"
@@ -142,11 +143,10 @@ int run_chat_tui(const std::string& model_path,
             messages.push_back({"assistant", response});
             std::cout << response;
 
-            std::vector<llama_token> response_toks(response.size() + 16);
-            int n_response_tokens = llama_tokenize(
-                vocab, response.c_str(), response.size(),
-                response_toks.data(), response_toks.size(),
-                /*add_special=*/false, /*parse_special=*/false);
+            int32_t n_response_tokens = 0;
+            (void)gizmo::tokenize_text(
+                vocab, response,
+                /*add_special=*/false, /*parse_special=*/false, &n_response_tokens);
             if (n_response_tokens < 0) n_response_tokens = 0;
 
             const double wall_s = std::chrono::duration<double>(t1 - t0).count();
