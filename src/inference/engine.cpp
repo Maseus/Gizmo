@@ -733,11 +733,31 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
         return result;
     }
 
-    const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(llama_context_));
-    if (n_tokens >= n_ctx) {
+    const int32_t n_ctx_current = static_cast<int32_t>(llama_n_ctx(llama_context_));
+    const int32_t n_ctx_effective =
+        config.context_size > 0 ? config.context_size : n_ctx_current;
+    if (n_tokens >= n_ctx_effective) {
         std::cerr << "Error: Context is too long (" << n_tokens
-                  << " tokens, context size " << n_ctx << ")\n";
+                  << " tokens, context size " << n_ctx_effective << ")\n";
         return result;
+    }
+
+    // Rebuild the context if the requested size differs from the current one.
+    if (config.context_size > 0 && n_ctx_current != config.context_size) {
+        llama_free(llama_context_);
+        llama_context_ = nullptr;
+        struct llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = config.context_size;
+        ctx_params.n_batch = 512;
+        ctx_params.n_ubatch = 512;
+        ctx_params.n_threads = sharded_n_threads_;
+        ctx_params.n_threads_batch = sharded_n_threads_;
+        llama_context_ = llama_init_from_model(llama_model_, ctx_params);
+        if (llama_context_ == nullptr) {
+            std::cerr << "Error: Failed to recreate llama context for context_size="
+                      << config.context_size << "\n";
+            return result;
+        }
     }
 
     if (do_prefill(llama_context_, (const llama_model*)llama_model_,
