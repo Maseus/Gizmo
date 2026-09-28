@@ -46,6 +46,21 @@ bool file_exists(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+std::vector<std::string> parse_colon_dirs(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == ':') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
@@ -105,8 +120,8 @@ void show_cursor() {
 // Shared model discovery + custom entry wrapper
 // ---------------------------------------------------------------------------
 
-std::vector<DiscoveredModel> discover_models_with_custom() {
-    auto models = gizmo::discover_models();
+std::vector<DiscoveredModel> discover_models_with_custom(const std::vector<std::string>& extra_dirs) {
+    auto models = gizmo::discover_models(extra_dirs);
     // Append the custom-path option.
     DiscoveredModel custom;
     custom.source = "custom";
@@ -283,27 +298,205 @@ std::vector<std::string> local_ipv4_addresses() {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Serve settings editor (interactive feature toggles)
+// ---------------------------------------------------------------------------
+
+struct ServeSettingsState {
+    std::string host = "0.0.0.0";
+    int port = 8080;
+    bool cors = false;
+    bool no_evict = false;
+    bool verbose = false;
+    int threads = 4;
+};
+
+// Editable fields for the settings screen. Order must match ServeSettingsState.
+enum class SettingsField : int {
+    Host,
+    Port,
+    Cors,
+    NoEvict,
+    Verbose,
+    Threads,
+    Start,
+    Count
+};
+
+ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
+    const bool is_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    ServeSettingsState st = seed;
+    if (!is_tty) {
+        return st;
+    }
+
+    RawMode raw;
+    if (!raw.enable()) {
+        return st;
+    }
+    CursorGuard cursor;
+    cursor.hide();
+
+    int selected = 0;
+    const int n_fields = static_cast<int>(SettingsField::Count);
+
+    auto field_label = [](SettingsField f) -> std::string {
+        switch (f) {
+            case SettingsField::Host:    return "Host";
+            case SettingsField::Port:    return "Port";
+            case SettingsField::Cors:    return "CORS";
+            case SettingsField::NoEvict: return "Keep weights resident (no eviction)";
+            case SettingsField::Verbose: return "Verbose sharded-engine output";
+            case SettingsField::Threads: return "Threads";
+            case SettingsField::Start:   return "[ Start server ]";
+            default: return "";
+        }
+    };
+
+    auto field_value = [&](SettingsField f) -> std::string {
+        switch (f) {
+            case SettingsField::Host:    return st.host;
+            case SettingsField::Port:    return std::to_string(st.port);
+            case SettingsField::Cors:    return st.cors ? "on" : "off";
+            case SettingsField::NoEvict: return st.no_evict ? "on" : "off";
+            case SettingsField::Verbose: return st.verbose ? "on" : "off";
+            case SettingsField::Threads: return std::to_string(st.threads);
+            default: return "";
+        }
+    };
+
+    std::string edit_buffer;
+    bool editing = false;
+    bool dirty = true;
+
+    auto draw = [&]() {
+        clear_screen();
+        std::cout << "\x1b[1;36mGizmo Server\x1b[0m - configure features\n\n";
+        std::cout << "Use \xe2\x86\x91/\xe2\x86\x93 to move, Enter to edit/toggle, q to quit.\n\n";
+        for (int i = 0; i < n_fields; ++i) {
+            SettingsField f = static_cast<SettingsField>(i);
+            bool active = (i == selected);
+            if (active && !editing) std::cout << "\x1b[7m";
+            std::cout << "  " << field_label(f);
+            if (f != SettingsField::Start) {
+                std::cout << ": ";
+                if (active && editing) {
+                    std::cout << "\x1b[36m" << edit_buffer << "_\x1b[0m";
+                } else {
+                    std::cout << field_value(f);
+                }
+            }
+            if (active && !editing) std::cout << "\x1b[0m";
+            std::cout << "\n";
+        }
+        std::cout << "\n\x1b[2mCORS is required for browser-based frontends (OpenWebUI, Hermes Desktop).\x1b[0m\n";
+        std::cout.flush();
+    };
+
+    auto apply_edit = [&]() {
+        if (edit_buffer.empty()) return;
+        SettingsField f = static_cast<SettingsField>(selected);
+        if (f == SettingsField::Host) {
+            st.host = edit_buffer;
+        } else if (f == SettingsField::Port) {
+            char* end = nullptr;
+            long v = std::strtol(edit_buffer.c_str(), &end, 10);
+            if (end != edit_buffer.c_str() && v > 0 && v < 65536) st.port = static_cast<int>(v);
+        } else if (f == SettingsField::Threads) {
+            char* end = nullptr;
+            long v = std::strtol(edit_buffer.c_str(), &end, 10);
+            if (end != edit_buffer.c_str() && v > 0 && v <= 256) st.threads = static_cast<int>(v);
+        }
+        edit_buffer.clear();
+        editing = false;
+    };
+
+    while (true) {
+        if (dirty) {
+            draw();
+            dirty = false;
+        }
+        char c = 0;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (c == 'q' || c == 'Q') {
+            return {};
+        }
+        if (editing) {
+            if (c == '\n' || c == '\r') {
+                apply_edit();
+                dirty = true;
+            } else if (c == 127 || c == '\b') {
+                if (!edit_buffer.empty()) edit_buffer.pop_back();
+                dirty = true;
+            } else if (c >= 32 && c < 127) {
+                edit_buffer.push_back(c);
+                dirty = true;
+            } else if (c == '\x1b') {
+                // Cancel edit on escape.
+                edit_buffer.clear();
+                editing = false;
+                dirty = true;
+            }
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
+            SettingsField f = static_cast<SettingsField>(selected);
+            if (f == SettingsField::Start) {
+                return st;
+            }
+            if (f == SettingsField::Cors || f == SettingsField::NoEvict || f == SettingsField::Verbose) {
+                bool* target = nullptr;
+                if (f == SettingsField::Cors) target = &st.cors;
+                else if (f == SettingsField::NoEvict) target = &st.no_evict;
+                else if (f == SettingsField::Verbose) target = &st.verbose;
+                if (target) *target = !(*target);
+                dirty = true;
+            } else {
+                edit_buffer = field_value(f);
+                editing = true;
+                dirty = true;
+            }
+            continue;
+        }
+        if (c == '\x1b') {
+            char seq[3] = {0};
+            if (read(STDIN_FILENO, &seq[0], 1) <= 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) <= 0) continue;
+            if (seq[0] == '[') {
+                if (seq[1] == 'A' && selected > 0) { --selected; dirty = true; }
+                else if (seq[1] == 'B' && selected + 1 < n_fields) { ++selected; dirty = true; }
+            }
+            continue;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server TUI public implementation
 // ---------------------------------------------------------------------------
 
 class ServerTui {
 public:
-    ServerTui(const std::string& host, int port, bool cors)
-        : host_(host), port_(port), cors_(cors) {}
+    explicit ServerTui(const ServeSettings& settings) : settings_(settings) {}
 
     int run() {
-        auto models = discover_models_with_custom();
-        std::string path;
-        if (models.empty()) {
-            // No discovered models: go straight to custom path.
-            path = ask_custom_path();
-        } else {
-            path = gizmo::pick_model_interactive(models);
-            if (path.empty()) {
-                // The user selected the custom-path option.
-                size_t custom_idx = models.size() - 1; // appended last
-                if (custom_idx < models.size() && models[custom_idx].source == "custom") {
-                    path = ask_custom_path();
+        std::string path = settings_.model_path;
+        if (path.empty()) {
+            auto extra_dirs = parse_colon_dirs(settings_.model_path_extra);
+            auto models = discover_models_with_custom(extra_dirs);
+            if (models.empty()) {
+                path = ask_custom_path();
+            } else {
+                path = gizmo::pick_model_interactive(models);
+                if (path.empty()) {
+                    // The user selected the custom-path option.
+                    size_t custom_idx = models.size() - 1; // appended last
+                    if (custom_idx < models.size() && models[custom_idx].source == "custom") {
+                        path = ask_custom_path();
+                    }
                 }
             }
         }
@@ -322,17 +515,30 @@ public:
             profile.resident_layers = ask_custom_resident_layers();
         }
 
-        return serve(path, profile);
+        ServeSettingsState st;
+        st.host = settings_.host;
+        st.port = settings_.port;
+        st.cors = settings_.cors;
+        st.no_evict = settings_.no_evict;
+        st.verbose = settings_.verbose;
+        st.threads = settings_.threads;
+        st = edit_settings_interactive(st);
+        if (st.host.empty()) {
+            std::cerr << "Server configuration cancelled.\n";
+            return 1;
+        }
+
+        return serve(path, profile, st);
     }
 
 private:
-    std::string host_;
-    int port_;
-    bool cors_;
+    ServeSettings settings_;
 
-    int serve(const std::string& model_path, const InferenceProfile& profile) {
+    int serve(const std::string& model_path, const InferenceProfile& profile,
+              const ServeSettingsState& st) {
         InferenceEngine engine;
-        engine.set_threads(4);
+        engine.set_verbose(st.verbose);
+        engine.set_threads(st.threads);
 
         clear_screen();
         std::cout << "\x1b[1;36mGizmo Server\x1b[0m\n";
@@ -342,6 +548,8 @@ private:
             std::cout << " (resident " << profile.resident_layers << " blocks)";
         }
         std::cout << "\n";
+        std::cout << "CORS: " << (st.cors ? "enabled" : "disabled") << "\n";
+        std::cout << "Listen: " << st.host << ":" << st.port << "\n";
         std::cout.flush();
 
         if (!engine.initialize(model_path, /*layer_shard_lazy=*/!profile.no_shard)) {
@@ -360,10 +568,10 @@ private:
         }
 
         ServerConfig config;
-        config.host = host_;
-        config.port = port_;
-        config.threads = 4;
-        config.cors = cors_;
+        config.host = st.host;
+        config.port = st.port;
+        config.threads = st.threads;
+        config.cors = st.cors;
 
         HttpServer server(engine, config);
         server.start();
@@ -371,7 +579,7 @@ private:
         // Small delay to let the listener start before we read is_running().
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (!server.is_running()) {
-            std::cerr << "\nFailed to start HTTP server on " << host_ << ":" << port_ << "\n";
+            std::cerr << "\nFailed to start HTTP server on " << st.host << ":" << st.port << "\n";
             return 1;
         }
 
@@ -391,13 +599,13 @@ private:
             } else {
                 std::cout << "  |  Sharding: disabled (full model)\n";
             }
-            std::cout << "Listen: " << host_ << ":" << port_ << "\n";
+            std::cout << "Listen: " << st.host << ":" << st.port << "\n";
 
             std::vector<std::string> ips = local_ipv4_addresses();
             std::cout << "IPs:    ";
             for (size_t i = 0; i < ips.size(); ++i) {
                 if (i) std::cout << ", ";
-                std::cout << "http://" << ips[i] << ":" << port_;
+                std::cout << "http://" << ips[i] << ":" << st.port;
             }
             std::cout << "\n\n";
 
@@ -452,8 +660,8 @@ private:
     }
 };
 
-int run_server_tui(const std::string& host, int port, bool cors) {
-    ServerTui tui(host, port, cors);
+int run_server_tui(const ServeSettings& settings) {
+    ServerTui tui(settings);
     return tui.run();
 }
 

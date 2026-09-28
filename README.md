@@ -24,6 +24,11 @@ gizmo run -m /path/to/model.gguf -p "Hello" --progress -n 4
 gizmo chat                     # interactive chat with model picker
 gizmo chat -m /path/to/model.gguf -n 64
 
+# Start the OpenAI-compatible HTTP server (interactive model + feature picker)
+gizmo serve
+# Or pass a model directly; use --cors for browser frontends (OpenWebUI, Hermes)
+gizmo serve -m /path/to/model.gguf --cors --port 8080
+
 # Add custom model directories (also set GIZMO_MODEL_PATH=~/models:/data/ggufs)
 gizmo chat --model-path ~/models:/data/ggufs
 ```
@@ -57,7 +62,7 @@ gizmo chat --model-path ~/models:/data/ggufs
 | `serve`     | Start HTTP server (OpenAI-compatible API); `server` is an alias |
 | `tui`       | Launch interactive server TUI (model picker + live dashboard) |
 
-When no command is given, `gizmo` starts an interactive chat TUI: pick a discovered model, then chat with a live footer showing tok/s, RSS, HWM, and token count. Use `gizmo tui` for the server dashboard instead.
+When no command is given, `gizmo` starts an interactive chat TUI: pick a discovered model, then chat with a live footer showing tok/s, RSS, HWM, and token count. Use `gizmo serve` for the OpenAI-compatible HTTP server with its own model picker and feature toggles.
 
 ## Options
 

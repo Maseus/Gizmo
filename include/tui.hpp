@@ -5,13 +5,36 @@
 
 namespace gizmo {
 
+// Settings that seed the interactive serve launcher.
+// If model_path is non-empty, the model picker is skipped.
+struct ServeSettings {
+    std::string model_path;       // optional pre-selected model
+    std::string model_path_extra; // colon-separated custom search dirs
+    std::string host = "0.0.0.0";
+    int32_t port = 8080;
+    int32_t threads = 4;
+    int32_t max_tokens = 128;
+    bool cors = false;
+    bool no_evict = false;
+    bool verbose = false;
+};
+
 // Launch the interactive Gizmo server TUI.
 // Discovers models from default Ollama/LM Studio directories, lets the user
 // pick one (or enter a custom path), loads the model, starts the HTTP server,
 // and renders a live activity dashboard until the user quits.
 //
 // Returns 0 on clean exit, non-zero on error.
-int run_server_tui(const std::string& host, int port, bool cors);
+int run_server_tui(const ServeSettings& settings);
+
+// Backwards-compatible overload.
+inline int run_server_tui(const std::string& host, int port, bool cors) {
+    ServeSettings s;
+    s.host = host;
+    s.port = port;
+    s.cors = cors;
+    return run_server_tui(s);
+}
 
 } // namespace gizmo
 

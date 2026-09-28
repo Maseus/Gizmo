@@ -66,7 +66,8 @@ cmake --build build -j$(nproc)
 ./build/gizmo chat --model-path ~/models:/data/ggufs
 
 # HTTP server (OpenAI-compatible; `serve` and `server` both work)
-./build/gizmo serve -m /path/to/model.gguf --port 8080
+./build/gizmo serve                 # interactive model + feature picker
+./build/gizmo serve -m /path/to/model.gguf --port 8080 --cors
 ./build/gizmo server -m /path/to/model.gguf --port 8080
 
 curl http://127.0.0.1:8080/v1/health

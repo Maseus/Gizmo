@@ -20,13 +20,6 @@
 #include <utility>
 #include <vector>
 
-// Global flag for signal handling (signal handlers can't capture)
-static std::atomic<bool> g_server_running{true};
-
-static void signal_handler(int) {
-    g_server_running.store(false);
-}
-
 namespace {
 
 namespace fs = std::filesystem;
@@ -1292,76 +1285,22 @@ int main(int argc, char* argv[]) {
             return ok ? 0 : 1;
         }
 
-        case gizmo::CommandType::Tui: {
-            return gizmo::run_server_tui(options.host, options.port, options.cors);
-        }
-
+        case gizmo::CommandType::Tui:
+            // fallthrough
         case gizmo::CommandType::Serve:
             // fallthrough
         case gizmo::CommandType::Server: {
-            if (options.model.empty()) {
-                std::cerr << "Error: --model required for server\n";
-                return 1;
-            }
-
-            gizmo::InferenceEngine engine;
-            engine.set_verbose(options.verbose);
-            engine.set_threads(options.threads.empty() ? 4 : options.threads[0]);
-            if (!engine.initialize(options.model, /*layer_shard_lazy=*/!options.no_shard)) {
-                std::cerr << "Failed to initialize inference engine\n";
-                return 1;
-            }
-
-            // Enable the per-block sharded engine for the prefill and decode
-            // steps when sharding was requested (the default).
-            if (!options.no_shard) {
-                engine.enable_sharded_engine(
-                    options.resident_layers.empty() ? 8 : options.resident_layers[0],
-                    /*evict_weights=*/!options.no_evict,
-                    /*row_size=*/options.row_size.empty() ? 1 : options.row_size[0]);
-                if (!engine.is_sharded()) {
-                    std::cout << "Note: sharded engine was not enabled; falling back to llama_decode.\n";
-                }
-            }
-
-            const int32_t n_layer = engine.n_layer();
-            std::cout << "Model: " << options.model << "\n";
-            std::cout << "Total layers: " << n_layer << "\n";
-            std::cout << "Embedding dim: " << engine.embedding_dim() << "\n";
-            std::cout << "Vocab size: " << engine.vocab_size() << "\n";
-
-            const size_t rss_after_load = gizmo::read_vm_rss_bytes();
-            std::cout << "VmRSS after model load: "
-                      << (rss_after_load / (1024 * 1024)) << " MB\n";
-
-            // Server config
-            gizmo::ServerConfig server_config;
-            server_config.host = options.host;
-            server_config.port = options.port;
-            server_config.threads = options.server_threads;
-            server_config.cors = options.cors;
-
-            gizmo::HttpServer server(engine, server_config);
-            server.start();
-
-            std::cout << "\nServer running. Press Ctrl+C to stop.\n";
-
-            // Set up signal handlers
-            g_server_running.store(true);
-            struct sigaction sa;
-            sa.sa_handler = signal_handler;
-            sigemptyset(&sa.sa_mask);
-            sa.sa_flags = 0;
-            sigaction(SIGINT, &sa, nullptr);
-            sigaction(SIGTERM, &sa, nullptr);
-
-            while (g_server_running.load() && server.is_running()) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-
-            server.stop();
-            std::cout << "\nServer stopped.\n";
-            return 0;
+            gizmo::ServeSettings settings;
+            settings.model_path = options.model;
+            auto dirs = model_search_dirs(options.model_path);
+            settings.model_path_extra = join_colon_dirs(dirs);
+            settings.host = options.host;
+            settings.port = options.port;
+            settings.threads = options.server_threads;
+            settings.cors = options.cors;
+            settings.no_evict = options.no_evict;
+            settings.verbose = options.verbose;
+            return gizmo::run_server_tui(settings);
         }
 
         case gizmo::CommandType::Run: {
