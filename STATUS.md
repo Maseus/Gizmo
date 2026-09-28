@@ -14,7 +14,7 @@
 - [x] Shared model discovery between chat TUI and server TUI (`model_discovery.hpp/cpp`)
 - [x] `--model-path` CLI flag and `GIZMO_MODEL_PATH` environment variable for custom model directories
 - [x] HTTP server with `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/v1/health`, `/v1/`, and `/health`
-- [x] `gizmo serve` interactive launcher: model picker, profile picker, feature toggles (CORS, host, port, threads, no-evict, verbose), then live server dashboard
+- [x] `gizmo serve -m <model>` starts the HTTP server with an interactive feature-toggles screen (CORS, host, port, threads, no-evict, verbose) and a live server dashboard
 - [x] Validation harness (`gizmo validate`) comparing sharded vs un-sharded logits
 - [x] Performance sweep (`gizmo sweep`) across threads, resident layers, and row size
 

@@ -17,7 +17,8 @@ cmake --build build -j$(nproc)
 ## Running
 
 ```bash
-# Show help
+# Show help (default when no command is given)
+./build/gizmo
 ./build/gizmo --help
 
 # Show system info
@@ -27,10 +28,10 @@ cmake --build build -j$(nproc)
 ./build/gizmo list
 
 # Launch the interactive chat TUI (pick a model, then chat with live speed/RSS footer)
-./build/gizmo
+./build/gizmo chat
 
 # Or launch the server dashboard TUI instead
-./build/gizmo tui
+./build/gizmo tui -m /path/to/model.gguf
 
 # Run a model with a prompt
 ./build/gizmo run -m /path/to/model.gguf -p "Hello!"
@@ -66,7 +67,6 @@ cmake --build build -j$(nproc)
 ./build/gizmo chat --model-path ~/models:/data/ggufs
 
 # HTTP server (OpenAI-compatible; `serve` and `server` both work)
-./build/gizmo serve                 # interactive model + feature picker
 ./build/gizmo serve -m /path/to/model.gguf --port 8080 --cors
 ./build/gizmo server -m /path/to/model.gguf --port 8080
 
@@ -86,7 +86,7 @@ curl http://127.0.0.1:8080/v1/models
 - ✅ Chat command with chat-template support
 - ✅ qwen3.5-family / qwen3.8 sharded-engine support (validated on 0.8B–27B)
 - ✅ `--progress` in-place indicator for sharded prefill/decode
-- ✅ Interactive default chat TUI with model picker + live speed/RSS footer
+- ✅ `gizmo chat` interactive chat TUI with model picker + live speed/RSS footer
 - ✅ Shared model discovery used by chat TUI and server TUI
 - ✅ `--model-path` / `GIZMO_MODEL_PATH` for custom model search directories
 - ✅ `serve` command alias and `/v1/health`, `/v1/` endpoints

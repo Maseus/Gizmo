@@ -15,9 +15,9 @@ cmake --build build -j$(nproc)
 cmake --install build --prefix ~/.local
 
 # Use it from anywhere
-gizmo --help
+gizmo --help                   # show help
 gizmo info
-gizmo                          # launch interactive chat TUI (pick model + chat live)
+gizmo chat                     # interactive chat with model picker
 gizmo run -m /path/to/model.gguf -p "Hello"
 gizmo run -m /path/to/model.gguf -p "Hello" -r 1 -n 4 --measure-ram
 gizmo run -m /path/to/model.gguf -p "Hello" --progress -n 4
@@ -59,10 +59,10 @@ gizmo chat --model-path ~/models:/data/ggufs
 | `list`      | Scan common model directories for `.gguf` files and print metadata |
 | `download`  | Download a model from URL using the system's `curl` or `wget` |
 | `info`      | Show system memory info |
-| `serve`     | Start HTTP server (OpenAI-compatible API); `server` is an alias |
+| `serve`     | Start HTTP server (OpenAI-compatible API); requires `-m`. `server` is an alias |
 | `tui`       | Launch interactive server TUI (model picker + live dashboard) |
 
-When no command is given, `gizmo` starts an interactive chat TUI: pick a discovered model, then chat with a live footer showing tok/s, RSS, HWM, and token count. Use `gizmo serve` for the OpenAI-compatible HTTP server with its own model picker and feature toggles.
+When no command is given, `gizmo` prints this help. Use `gizmo chat` for the interactive chat TUI and `gizmo serve -m <model>` for the OpenAI-compatible HTTP server.
 
 ## Options
 

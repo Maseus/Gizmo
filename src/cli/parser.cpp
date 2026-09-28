@@ -155,7 +155,7 @@ CliOptions CliParser::parse(int argc, char* argv[]) {
     CliOptions options;
 
     if (argc < 2) {
-        options.command = CommandType::Chat;  // default: interactive chat TUI
+        options.command = CommandType::Help;  // default: show help
         return options;
     }
 
@@ -195,7 +195,7 @@ Gizmo - Low-resource LLM inference with layer sharding
 Usage: gizmo [command] [options]
 
 Commands:
-  (none)    Launch the interactive chat TUI (model picker + Claude Code-like REPL)
+  (none)    Show this help message
   run       Run a model with a single prompt
   chat      Interactive chat mode with streaming output and speed stats
   bench     Run memory/performance benchmark across prompt lengths

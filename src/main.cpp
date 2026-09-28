@@ -1290,6 +1290,10 @@ int main(int argc, char* argv[]) {
         case gizmo::CommandType::Serve:
             // fallthrough
         case gizmo::CommandType::Server: {
+            if (options.model.empty()) {
+                parser.print_help();
+                return 0;
+            }
             gizmo::ServeSettings settings;
             settings.model_path = options.model;
             auto dirs = model_search_dirs(options.model_path);
