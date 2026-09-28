@@ -1,0 +1,14 @@
+# Build outputs
+build/
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Claude Code session artifacts
+.claude/
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
