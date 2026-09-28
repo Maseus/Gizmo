@@ -317,6 +317,20 @@ void HttpServer::stop() {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+
+    // A streaming request that started while stop() was in progress may have
+    // added a worker after the first join pass. Join any stragglers before
+    // releasing server resources so the destructor never sees a joinable thread.
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        for (auto& t : stream_workers_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        stream_workers_.clear();
+    }
+
     if (log_stream_.is_open()) {
         log_stream_.flush();
     }
@@ -420,9 +434,12 @@ void HttpServer::emit_json_log(const RequestLogEntry& entry) {
     if (config_.json_logs) {
         std::cerr << line << "\n";
     }
-    if (log_stream_.is_open()) {
-        log_stream_ << line << "\n";
-        log_stream_.flush();
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        if (log_stream_.is_open()) {
+            log_stream_ << line << "\n";
+            log_stream_.flush();
+        }
     }
 }
 
