@@ -8,7 +8,7 @@ A C++ command-line wrapper around llama.cpp for running quantized LLMs locally, 
 
 ```bash
 # Install the latest release binary (requires ~/.local/bin on PATH)
-curl -fsSL https://raw.githubusercontent.com/maseus/gizmo/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Maseus/Gizmo/master/install.sh | bash
 
 # Or build from source (uses CMake; produces a static binary)
 cmake -S . -B build -DCMAKE_BUILD_TYPE Release

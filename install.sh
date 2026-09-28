@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-REPO="maseus/gizmo"
+REPO="Maseus/Gizmo"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 FORCE="${FORCE:-0}"
 
