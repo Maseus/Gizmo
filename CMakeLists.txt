@@ -42,12 +42,13 @@ add_subdirectory(tools/sharded_engine)
 add_executable(gizmo
     src/main.cpp
     src/cli/parser.cpp
-    src/layer/manager.cpp
     src/model/manager.cpp
     src/inference/engine.cpp
+    src/inference/chat_template.cpp
     src/util/proc_status.cpp
     src/server/server.cpp
     src/ui/tui.cpp
+    src/ui/terminal_utils.cpp
     src/ui/model_discovery.cpp
     src/ui/chat_tui.cpp
 )

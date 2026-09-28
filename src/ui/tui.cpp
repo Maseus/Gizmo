@@ -5,6 +5,8 @@
 #include "model_discovery.hpp"
 #include "proc_status.hpp"
 #include "server/server.hpp"
+#include "terminal_utils.hpp"
+#include "util/string.hpp"
 
 #include "json.hpp"
 
@@ -44,76 +46,6 @@ namespace {
 bool file_exists(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-}
-
-std::vector<std::string> parse_colon_dirs(const std::string& s) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : s) {
-        if (c == ':') {
-            if (!cur.empty()) out.push_back(cur);
-            cur.clear();
-        } else {
-            cur.push_back(c);
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Terminal control
-// ---------------------------------------------------------------------------
-
-// Forward declarations for terminal control used by CursorGuard.
-void hide_cursor();
-void show_cursor();
-
-struct CursorGuard {
-    bool hidden = false;
-    void hide() { hide_cursor(); hidden = true; }
-    ~CursorGuard() { if (hidden) show_cursor(); }
-};
-
-struct RawMode {
-    termios old_tio;
-    bool active = false;
-
-    bool enable() {
-        if (tcgetattr(STDIN_FILENO, &old_tio) != 0) return false;
-        termios new_tio = old_tio;
-        new_tio.c_lflag &= ~(ICANON | ECHO);
-        new_tio.c_cc[VMIN] = 0;
-        new_tio.c_cc[VTIME] = 0;
-        if (tcsetattr(STDIN_FILENO, TCSANOW, &new_tio) != 0) return false;
-        active = true;
-        return true;
-    }
-
-    void disable() {
-        if (active) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
-            active = false;
-        }
-    }
-
-    ~RawMode() { disable(); }
-};
-
-void clear_screen() {
-    std::cout << "\x1b[2J\x1b[H";
-}
-
-void hide_cursor() {
-    std::cout << "\x1b[?25l";
-}
-
-void show_cursor() {
-    std::cout << "\x1b[?25h";
 }
 
 // ---------------------------------------------------------------------------
@@ -651,10 +583,10 @@ private:
 
         // Main dashboard loop: refresh periodically and check for 'q'.
         bool user_quit = false;
-        while (server.is_running() && !user_quit) {
+        while (server.is_running() && !user_quit && !server.stop_requested()) {
             draw();
             for (int i = 0; i < 20; ++i) { // ~2 second polling window
-                if (!server.is_running()) break;
+                if (!server.is_running() || server.stop_requested()) break;
                 if (raw_ok) {
                     char c = 0;
                     if (read(STDIN_FILENO, &c, 1) == 1 && (c == 'q' || c == 'Q')) {
@@ -736,7 +668,7 @@ int serve_headless(const ServeSettings& settings) {
     }
     std::cout << "Press Ctrl+C to stop.\n";
 
-    while (server.is_running()) {
+    while (server.is_running() && !server.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 

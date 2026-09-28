@@ -36,10 +36,18 @@ namespace {
 // provider thread pops them and writes them to the response sink.
 class StreamChunkQueue {
 public:
+    static constexpr size_t kMaxChunks = 64;
+
     void push(const std::string& chunk) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (closed_) return;
+            // Keep memory bounded for slow consumers: drop oldest chunks if
+            // the backlog grows too large. The final chunks are tiny and
+            // still fit after this.
+            if (chunks_.size() >= kMaxChunks) {
+                chunks_.pop_front();
+            }
             chunks_.push_back(chunk);
         }
         cv_.notify_one();
@@ -158,12 +166,27 @@ HttpServer::~HttpServer() {
     stop();
 }
 
+namespace {
+
+std::atomic<HttpServer*> g_signal_target{nullptr};
+std::atomic<bool> g_signal_handlers_installed{false};
+
+} // namespace
+
 void HttpServer::install_signal_handlers(HttpServer* instance) {
-    static HttpServer* target = nullptr;
-    target = instance;
+    // Only the currently registered server should react to signals.
+    g_signal_target.store(instance, std::memory_order_relaxed);
+
+    if (g_signal_handlers_installed.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+
     auto handler = [](int /*sig*/) {
+        HttpServer* target = g_signal_target.load(std::memory_order_relaxed);
         if (target != nullptr) {
-            target->stop();
+            // Async-signal-safe: only flip an atomic flag. The main loop(s)
+            // call stop() from normal execution context.
+            target->request_stop();
         }
     };
     std::signal(SIGINT, handler);
@@ -198,6 +221,18 @@ void HttpServer::start() {
     svr_->Post("/v1/completions", [this](const Request& req, Response& res) { handle_completions(req, res); });
     svr_->Post("/v1/chat/completions", [this](const Request& req, Response& res) { handle_chat_completions(req, res); });
 
+    // Unknown routes return a JSON error so OpenAI clients can parse it.
+    svr_->set_error_handler([this](const Request& /*req*/, Response& res) {
+        set_cors_headers(res);
+        res.status = 404;
+        json err;
+        err["error"]["message"] = "Not found";
+        err["error"]["type"] = "invalid_request_error";
+        err["error"]["param"] = nullptr;
+        err["error"]["code"] = 404;
+        res.set_content(err.dump(), "application/json");
+    });
+
     // Preflight for CORS (always registered when CORS is on; some clients probe
     // OPTIONS before POST).
     if (config_.cors) {
@@ -231,16 +266,29 @@ void HttpServer::start() {
 
 void HttpServer::stop() {
     stop_requested_.store(true);
+
+    // Wait for any detached streaming generation workers to finish. They
+    // observe stop_requested_ and break out of generation quickly.
+    {
+        std::lock_guard<std::mutex> lock(stream_mutex_);
+        for (auto& t : stream_workers_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        stream_workers_.clear();
+    }
+
     {
         std::lock_guard<std::mutex> lock(svr_mutex_);
         if (svr_ != nullptr) {
             svr_->stop();
         }
     }
-    running_.store(false);
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    running_.store(false);
 }
 
 bool HttpServer::is_running() const {
@@ -299,11 +347,13 @@ HttpServer::GenerationSlot::GenerationSlot(GenerationSlot&& other) noexcept
 
 HttpServer::GenerationSlot& HttpServer::GenerationSlot::operator=(GenerationSlot&& other) noexcept {
     if (this != &other) {
-        // Release any currently held slot.
+        // Release any currently held slot before taking over the new one.
         if (acquired_ && server_ != nullptr) {
             server_->active_generations_--;
         }
-        lock_.unlock();
+        if (lock_.owns_lock()) {
+            lock_.unlock();
+        }
 
         server_ = other.server_;
         acquired_ = other.acquired_;
@@ -318,7 +368,7 @@ HttpServer::GenerationSlot::~GenerationSlot() {
     if (acquired_ && server_ != nullptr) {
         server_->active_generations_--;
     }
-    // lock_ is released here; the next waiter can proceed.
+    // lock_ is released here (if it owns the mutex); the next waiter proceeds.
 }
 
 void HttpServer::emit_json_log(const RequestLogEntry& entry) {
@@ -362,9 +412,16 @@ void HttpServer::record_request(const httplib::Request& req, const httplib::Resp
         while (request_log_.size() > kMaxLogEntries) {
             request_log_.pop_front();
         }
-        if (request_callback_) {
-            request_callback_(entry);
-        }
+    }
+    // Invoke the user callback outside the lock so a callback that reads
+    // the log cannot deadlock.
+    std::function<void(const RequestLogEntry&)> cb;
+    {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        cb = request_callback_;
+    }
+    if (cb) {
+        cb(entry);
     }
     emit_json_log(entry);
 }
@@ -658,17 +715,15 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             const auto t0 = std::chrono::steady_clock::now();
             auto timeout = std::chrono::steady_clock::now() +
                            std::chrono::seconds(config_.request_timeout_seconds);
-            auto should_cancel = [this, timeout, queue]() {
-                if (stop_requested_.load() || std::chrono::steady_clock::now() > timeout) {
-                    queue->close();
-                    return true;
-                }
-                return false;
+            // The cancel predicate only sets the generation abort flag. The
+            // worker thread is responsible for emitting the final SSE chunk
+            // and [DONE] so the client always sees a complete stream.
+            auto should_cancel = [this, timeout]() {
+                return stop_requested_.load() || std::chrono::steady_clock::now() > timeout;
             };
 
             bool ok = engine_.generate_stream(prompt, config,
                 [queue, &first, model_id, &completion_tokens](const std::string& token_text, int32_t) {
-                    if (queue->is_closed()) return;
                     ++completion_tokens;
                     json chunk;
                     chunk["id"] = "chatcmpl-" + model_id;
@@ -693,10 +748,6 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }, should_cancel);
             const double elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
-
-            if (queue->is_closed()) {
-                return;
-            }
 
             // Final chunk with finish_reason="stop" (or "error" on failure).
             json final_chunk;
@@ -723,7 +774,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             record_request(fake_req, fake_res, prompt_tokens + completion_tokens, elapsed, request_id,
                            ok ? "" : "Streaming generation failed or timed out");
         });
-        gen_thread.detach();
+
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_workers_.push_back(std::move(gen_thread));
+        }
 
         res.set_header("Content-Type", "text/event-stream");
         res.set_header("Cache-Control", "no-cache");

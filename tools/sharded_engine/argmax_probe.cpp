@@ -32,9 +32,14 @@ int main(int argc, char** argv) {
     llama_context* ctx = llama_init_from_model(model, cparams);
     if (!ctx) { std::fprintf(stderr, "ctx init failed\n"); return 1; }
 
-    std::vector<llama_token> toks(64);
-    int n = llama_tokenize(llama_model_get_vocab(model), prompt, std::strlen(prompt),
-                           toks.data(), toks.size(), true, true);
+    const struct llama_vocab* vocab = llama_model_get_vocab(model);
+    int n_needed = llama_tokenize(vocab, prompt, static_cast<int32_t>(std::strlen(prompt)),
+                                  nullptr, 0, true, true);
+    if (n_needed == 0) { std::fprintf(stderr, "empty prompt\n"); return 1; }
+    if (n_needed < 0) { n_needed = -n_needed; }
+    std::vector<llama_token> toks(static_cast<size_t>(n_needed));
+    int n = llama_tokenize(vocab, prompt, static_cast<int32_t>(std::strlen(prompt)),
+                           toks.data(), n_needed, true, true);
     if (n < 0) { std::fprintf(stderr, "tok fail\n"); return 1; }
 
     llama_batch batch = llama_batch_init(n, 0, 1);
@@ -57,14 +62,18 @@ int main(int argc, char** argv) {
     int best_id = 0;
     float best_val = logits[0];
     for (int i = 1; i < n_vocab; ++i) {
-        if (logits[i] > best_val) { best_val = logits[i]; best_id = i; }
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best_id = i;
+        }
     }
     std::printf("prompt: \"%s\" -> %d tokens\n", prompt, n);
     for (int i = 0; i < n; ++i) std::printf("  [%d] %d\n", i, toks[i]);
     char piece_buf[256];
     int pn = llama_token_to_piece(llama_model_get_vocab(model), best_id,
                                    piece_buf, sizeof(piece_buf), 0, false);
-    if (pn < 0) pn = 0; piece_buf[pn] = 0;
+    if (pn < 0) pn = 0;
+    piece_buf[pn] = 0;
     std::printf("argmax: id=%d logit=%.4f text=\"%s\"\n", best_id, best_val, piece_buf);
 
     // Top-K for context.
@@ -77,7 +86,8 @@ int main(int argc, char** argv) {
         int id = scored[i].second;
         pn = llama_token_to_piece(llama_model_get_vocab(model), id,
                                    piece_buf, sizeof(piece_buf), 0, false);
-        if (pn < 0) pn = 0; piece_buf[pn] = 0;
+        if (pn < 0) pn = 0;
+    piece_buf[pn] = 0;
         std::printf("  [%d] id=%d logit=%.4f text=\"%s\"\n",
                     i, id, scored[i].first, piece_buf);
     }

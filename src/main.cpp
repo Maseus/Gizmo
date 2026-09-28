@@ -1,4 +1,5 @@
 #include "chat_tui.hpp"
+#include "chat_template.hpp"
 #include "cli_parser.hpp"
 #include "inference_engine.hpp"
 #include "model_discovery.hpp"
@@ -6,6 +7,7 @@
 #include "proc_status.hpp"
 #include "server/server.hpp"
 #include "tui.hpp"
+#include "util/string.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -24,94 +26,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Parse a colon-separated list of directories (e.g. "~/models:/data/ggufs").
-// Empty entries are ignored.
-std::vector<std::string> parse_colon_dirs(const std::string& s) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : s) {
-        if (c == ':') {
-            if (!cur.empty()) out.push_back(cur);
-            cur.clear();
-        } else {
-            cur.push_back(c);
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-std::string join_colon_dirs(const std::vector<std::string>& dirs) {
-    std::string out;
-    for (size_t i = 0; i < dirs.size(); ++i) {
-        if (i > 0) out += ':';
-        out += dirs[i];
-    }
-    return out;
-}
-
-// Build the ordered list of model-search directories from:
-// 1) --model-path CLI flag, 2) GIZMO_MODEL_PATH env var, 3) built-in defaults.
-std::vector<std::string> model_search_dirs(const std::string& cli_model_path) {
-    std::vector<std::string> dirs;
-    auto cli_dirs = parse_colon_dirs(cli_model_path);
-    dirs.insert(dirs.end(), cli_dirs.begin(), cli_dirs.end());
-
-    const char* env = getenv("GIZMO_MODEL_PATH");
-    if (env) {
-        auto env_dirs = parse_colon_dirs(env);
-        dirs.insert(dirs.end(), env_dirs.begin(), env_dirs.end());
-    }
-
-    const char* home = getenv("HOME");
-    if (home) {
-        dirs.push_back(std::string(home) + "/.local/share/gizmo/models");
-        dirs.push_back(std::string(home) + "/.lmstudio/models");
-        dirs.push_back(std::string(home) + "/.ollama/models/blobs");
-    }
-    dirs.push_back("./models");
-
-    // De-duplicate while preserving order.
-    std::vector<std::string> unique;
-    for (const auto& d : dirs) {
-        if (std::find(unique.begin(), unique.end(), d) == unique.end()) {
-            unique.push_back(d);
-        }
-    }
-    return unique;
-}
-
-// Scan a set of common model directories for GGUF files, skipping helper
-// files (mmproj, mtp, embeddings, vision tensors).
-std::vector<std::string> scan_for_ggufs() {
-    auto dirs = model_search_dirs("");
-    std::vector<std::string> out;
-    for (const auto& dir : dirs) {
-        if (!fs::exists(dir) || !fs::is_directory(dir)) {
-            continue;
-        }
-        try {
-            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
-                if (!entry.is_regular_file()) continue;
-                const auto& p = entry.path();
-                if (p.extension() != ".gguf") continue;
-                const std::string name = p.filename().string();
-                std::string lower = name;
-                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                if (lower.find("mmproj") != std::string::npos) continue;
-                if (lower.find("mtp")    != std::string::npos) continue;
-                if (lower.find("embed")  != std::string::npos) continue;
-                if (lower.find("vision") != std::string::npos) continue;
-                out.push_back(p.string());
-            }
-        } catch (const std::exception&) {
-            // ignore permission errors during traversal
-        }
-    }
-    std::sort(out.begin(), out.end());
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
 
 // One benchmark cell: a (N, path) measurement.
 struct bench_row_t {
@@ -607,39 +521,6 @@ static int do_validate(
 // Minimal interactive chat. Maintains a simple text context, prints the
 // assistant response as it streams, and shows tok/s plus memory at the end
 // of each turn. Commands: /quit, /reset, /clear.
-static std::string apply_chat_template(
-    const llama_model* model,
-    const std::vector<std::pair<std::string, std::string>>& messages,
-    bool add_ass
-) {
-    if (!model || messages.empty()) {
-        return "";
-    }
-
-    const char* tmpl = llama_model_chat_template(model, /*name=*/nullptr);
-    std::vector<llama_chat_message> chat;
-    chat.reserve(messages.size());
-    for (const auto& m : messages) {
-        chat.push_back({m.first.c_str(), m.second.c_str()});
-    }
-
-    std::string buf(4096, '\0');
-    int32_t needed = llama_chat_apply_template(
-        tmpl, chat.data(), chat.size(), add_ass, buf.data(), static_cast<int32_t>(buf.size()));
-    if (needed < 0) {
-        return "";
-    }
-    if (needed > static_cast<int32_t>(buf.size())) {
-        buf.resize(static_cast<size_t>(needed) + 1);
-        needed = llama_chat_apply_template(
-            tmpl, chat.data(), chat.size(), add_ass, buf.data(), static_cast<int32_t>(buf.size()));
-    }
-    if (needed <= 0) {
-        return "";
-    }
-    return std::string(buf.data(), static_cast<size_t>(needed));
-}
-
 static int do_chat(
     const std::string& model_path,
     int32_t resident_layers,
@@ -727,7 +608,7 @@ static int do_chat(
         // Add the new user message and format the full conversation with the
         // model's chat template, ending with the assistant prefix.
         messages.push_back({"user", input});
-        std::string prompt = apply_chat_template(engine.raw_model(), messages, /*add_ass=*/true);
+        std::string prompt = gizmo::apply_chat_template(engine.raw_model(), messages, /*add_ass=*/true);
         if (prompt.empty()) {
             // Fall back to a simple format if no template is available.
             prompt.clear();
@@ -1177,7 +1058,7 @@ int main(int argc, char* argv[]) {
 
         case gizmo::CommandType::List: {
             std::cout << "Available models:\n";
-            auto paths = scan_for_ggufs();
+            auto paths = gizmo::scan_for_ggufs();
             if (paths.empty()) {
                 std::cout << "(No GGUF models found in ~/.local/share/gizmo/models, "
                           << "~/.lmstudio/models, ~/.ollama/models/blobs, or ./models)\n";
@@ -1209,9 +1090,9 @@ int main(int argc, char* argv[]) {
         case gizmo::CommandType::Chat: {
             if (options.model.empty()) {
                 // Launch the interactive chat TUI with a model picker.
-                auto dirs = model_search_dirs(options.model_path);
+                auto dirs = gizmo::build_search_dirs(gizmo::parse_colon_dirs(options.extra_model_dirs));
                 return gizmo::run_chat_tui("",
-                                           join_colon_dirs(dirs),
+                                           gizmo::join_colon_dirs(dirs),
                                            options.max_tokens,
                                            options.threads.empty() ? 4 : options.threads[0]);
             }
@@ -1288,8 +1169,8 @@ int main(int argc, char* argv[]) {
         case gizmo::CommandType::Tui: {
             gizmo::ServeSettings settings;
             settings.model_path = options.model;
-            auto dirs = model_search_dirs(options.model_path);
-            settings.model_path_extra = join_colon_dirs(dirs);
+            auto dirs = gizmo::build_search_dirs(gizmo::parse_colon_dirs(options.extra_model_dirs));
+            settings.model_path_extra = gizmo::join_colon_dirs(dirs);
             settings.host = options.host;
             settings.port = options.port;
             settings.threads = options.server_threads;
@@ -1314,8 +1195,8 @@ int main(int argc, char* argv[]) {
             }
             gizmo::ServeSettings settings;
             settings.model_path = options.model;
-            auto dirs = model_search_dirs(options.model_path);
-            settings.model_path_extra = join_colon_dirs(dirs);
+            auto dirs = gizmo::build_search_dirs(gizmo::parse_colon_dirs(options.extra_model_dirs));
+            settings.model_path_extra = gizmo::join_colon_dirs(dirs);
             settings.host = options.host;
             settings.port = options.port;
             settings.threads = options.server_threads;

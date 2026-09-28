@@ -59,7 +59,7 @@ struct CliOptions {
     std::string download_url;     // URL to download from
 
     // Default model search directories (colon-separated on CLI).
-    std::string model_path;       // extra directories to scan for GGUFs
+    std::string extra_model_dirs; // extra directories to scan for GGUFs
 };
 
 class CliParser {

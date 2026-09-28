@@ -55,11 +55,17 @@ public:
     // listener thread to finish and attempts to cancel in-flight generation.
     void stop();
 
+    // Request a stop without blocking. Safe to call from a signal handler.
+    void request_stop() { stop_requested_.store(true); }
+
     // Check if server is running
     bool is_running() const;
 
     // True once the listener thread reports it is accepting connections.
     bool ready() const;
+
+    // True if a SIGINT/SIGTERM has been received and the server should stop.
+    bool stop_requested() const { return stop_requested_.load(); }
 
     // Activity surfaced to the TUI.
     // `limit` caps the number of most recent entries returned.
@@ -83,6 +89,11 @@ private:
     std::unique_ptr<httplib::Server> svr_;
     std::thread server_thread_;
     mutable std::mutex svr_mutex_;
+
+    // In-flight streaming generation workers that must be joined before
+    // the httplib server is torn down.
+    mutable std::mutex stream_mutex_;
+    std::vector<std::thread> stream_workers_;
 
     // Activity log consumed by the TUI dashboard.
     mutable std::mutex log_mutex_;

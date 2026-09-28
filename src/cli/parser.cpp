@@ -141,7 +141,7 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
         } else if (arg == "--url") {
             if (i + 1 < argc) options.download_url = argv[++i];
         } else if (arg == "--model-path") {
-            if (i + 1 < argc) options.model_path = argv[++i];
+            if (i + 1 < argc) options.extra_model_dirs = argv[++i];
         }
     }
 

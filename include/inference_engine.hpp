@@ -13,7 +13,7 @@
 namespace gizmo {
 
 struct InferenceConfig {
-    int32_t context_size = 512;
+    int32_t context_size = 4096;
     int32_t max_tokens = 256;
     float temperature = 0.8f;
     float top_p = 0.95f;
@@ -79,6 +79,10 @@ public:
     // before enable_sharded_engine() to take effect on the sharded path;
     // called at runtime it updates the native context threads.
     void set_threads(int32_t threads);
+
+    // Set the llama context size used when the context is created. Call
+    // before initialize(). The default is 4096 tokens.
+    void set_context_size(int32_t context_size) { context_size_ = context_size; }
 
     // Generate text from a prompt. If `quiet` is true, token output
     // and progress messages are suppressed (used by sweep/bench).
@@ -176,6 +180,7 @@ private:
     int32_t layers_loaded_;
     llama_context* llama_context_;
     llama_model*   llama_model_;
+    int32_t        context_size_ = 4096;
 
     // Sharded-engine state. Built in enable_sharded_engine(), freed
     // in the destructor. Both pointers may be null when the un-sharded

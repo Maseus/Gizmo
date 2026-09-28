@@ -1,8 +1,11 @@
 #include "chat_tui.hpp"
 
+#include "chat_template.hpp"
 #include "inference_engine.hpp"
 #include "model_discovery.hpp"
 #include "proc_status.hpp"
+#include "terminal_utils.hpp"
+#include "util/string.hpp"
 
 #include "llama.h"
 
@@ -23,102 +26,6 @@
 namespace gizmo {
 
 namespace {
-
-// Terminal control helpers.
-void clear_screen() {
-    std::cout << "\x1b[2J\x1b[H";
-}
-
-void hide_cursor() {
-    std::cout << "\x1b[?25l";
-}
-
-void show_cursor() {
-    std::cout << "\x1b[?25h";
-}
-
-void move_cursor(int row, int col) {
-    std::cout << "\x1b[" << row << ";" << col << "H";
-}
-
-void clear_line() {
-    std::cout << "\x1b[2K\r";
-}
-
-struct RawMode {
-    termios old_tio;
-    bool active = false;
-
-    bool enable() {
-        if (tcgetattr(STDIN_FILENO, &old_tio) != 0) return false;
-        termios new_tio = old_tio;
-        new_tio.c_lflag &= ~(ICANON | ECHO);
-        new_tio.c_cc[VMIN] = 0;
-        new_tio.c_cc[VTIME] = 0;
-        if (tcsetattr(STDIN_FILENO, TCSANOW, &new_tio) != 0) return false;
-        active = true;
-        return true;
-    }
-
-    void disable() {
-        if (active) {
-            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
-            active = false;
-        }
-    }
-
-    ~RawMode() { disable(); }
-};
-
-struct CursorGuard {
-    bool hidden = false;
-    void hide() { hide_cursor(); hidden = true; }
-    ~CursorGuard() { if (hidden) show_cursor(); }
-};
-
-// Apply the model's built-in chat template to a message list.
-std::string apply_chat_template(
-    const llama_model* model,
-    const std::vector<std::pair<std::string, std::string>>& messages,
-    bool add_ass
-) {
-    if (!model || messages.empty()) return "";
-
-    const char* tmpl = llama_model_chat_template(model, /*name=*/nullptr);
-    std::vector<llama_chat_message> chat;
-    chat.reserve(messages.size());
-    for (const auto& m : messages) {
-        chat.push_back({m.first.c_str(), m.second.c_str()});
-    }
-
-    std::string buf(4096, '\0');
-    int32_t needed = llama_chat_apply_template(
-        tmpl, chat.data(), chat.size(), add_ass, buf.data(), static_cast<int32_t>(buf.size()));
-    if (needed < 0) return "";
-    if (needed > static_cast<int32_t>(buf.size())) {
-        buf.resize(static_cast<size_t>(needed) + 1);
-        needed = llama_chat_apply_template(
-            tmpl, chat.data(), chat.size(), add_ass, buf.data(), static_cast<int32_t>(buf.size()));
-    }
-    if (needed <= 0) return "";
-    return std::string(buf.data(), static_cast<size_t>(needed));
-}
-
-// Parse colon-separated directories from a string.
-std::vector<std::string> parse_model_path_dirs(const std::string& s) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : s) {
-        if (c == ':') {
-            if (!cur.empty()) out.push_back(cur);
-            cur.clear();
-        } else {
-            cur.push_back(c);
-        }
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
 
 // Ask for a custom GGUF path on the terminal (restores canonical mode).
 std::string ask_custom_path() {
@@ -143,7 +50,7 @@ int run_chat_tui(const std::string& model_path,
     // Resolve model path.
     std::string path = model_path;
     if (path.empty()) {
-        auto extra_dirs = parse_model_path_dirs(model_path_extra);
+        auto extra_dirs = parse_colon_dirs(model_path_extra);
         auto models = discover_models(extra_dirs);
         // Append a custom-path option.
         DiscoveredModel custom;
@@ -217,7 +124,7 @@ int run_chat_tui(const std::string& model_path,
             if (input.empty()) continue;
 
             messages.push_back({"user", input});
-            std::string prompt = apply_chat_template(engine.raw_model(), messages, /*add_ass=*/true);
+            std::string prompt = gizmo::apply_chat_template(engine.raw_model(), messages, /*add_ass=*/true);
             if (prompt.empty()) {
                 prompt.clear();
                 for (const auto& m : messages) {
@@ -382,9 +289,15 @@ int run_chat_tui(const std::string& model_path,
             continue;
         }
 
-        if (c == 3 || c == 'q' || c == 'Q') {
-            // Ctrl+C or 'q' while not typing: quit. We check for /quit after Enter.
+        if (c == 3) {
+            // Ctrl+C quits immediately.
             break;
+        }
+        if (c == 27) {
+            // Discard a likely ANSI/arrow-key escape sequence.
+            char discard[2] = {0, 0};
+            (void)read(STDIN_FILENO, discard, 2);
+            continue;
         }
         if (c == '\n' || c == '\r') {
             std::string trimmed = input;

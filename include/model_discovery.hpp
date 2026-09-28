@@ -15,6 +15,21 @@ struct DiscoveredModel {
     uint64_t    size_bytes = 0;
 };
 
+// Build the ordered list of directories to scan, merging:
+//   1) explicit extra_dirs
+//   2) the GIZMO_MODEL_PATH environment variable
+//   3) built-in defaults (~/.local/share/gizmo/models, ~/.lmstudio/models,
+//      ~/.ollama/models/blobs, ./models)
+// Duplicates are removed while preserving order.
+std::vector<std::string> build_search_dirs(
+    const std::vector<std::string>& extra_dirs = {});
+
+// Scan the built-in (and optional extra) model directories for GGUF files,
+// skipping helper files such as mmproj, mtp, embedding, and vision tensors.
+// Results are sorted and de-duplicated.
+std::vector<std::string> scan_for_ggufs(
+    const std::vector<std::string>& extra_dirs = {});
+
 // Scan common model directories (and any extra directories supplied by the
 // caller) for GGUF files. Skips helper files such as mmproj, mtp, embedding,
 // and vision tensors. A trailing "custom" entry is not appended here; callers

@@ -1,6 +1,8 @@
 #include "model_discovery.hpp"
 
 #include "json.hpp"
+#include "terminal_utils.hpp"
+#include "util/string.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -26,11 +28,6 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace {
-
-// Forward declarations for terminal control used by pick_model_interactive.
-void clear_screen();
-void hide_cursor();
-void show_cursor();
 
 std::string home_dir() {
     const char* home = getenv("HOME");
@@ -202,20 +199,48 @@ std::vector<DiscoveredModel> discover_user_models(const std::vector<std::string>
     return out;
 }
 
-// Terminal control helpers.
-void clear_screen() {
-    std::cout << "\x1b[2J\x1b[H";
-}
-
-void hide_cursor() {
-    std::cout << "\x1b[?25l";
-}
-
-void show_cursor() {
-    std::cout << "\x1b[?25h";
-}
-
 } // namespace
+
+std::vector<std::string> build_search_dirs(
+    const std::vector<std::string>& extra_dirs
+) {
+    std::vector<std::string> dirs = extra_dirs;
+
+    const char* env = getenv("GIZMO_MODEL_PATH");
+    if (env) {
+        auto env_dirs = parse_colon_dirs(env);
+        dirs.insert(dirs.end(), env_dirs.begin(), env_dirs.end());
+    }
+
+    const char* home = getenv("HOME");
+    if (home) {
+        dirs.push_back(std::string(home) + "/.local/share/gizmo/models");
+        dirs.push_back(std::string(home) + "/.lmstudio/models");
+        dirs.push_back(std::string(home) + "/.ollama/models/blobs");
+    }
+    dirs.push_back("./models");
+
+    std::vector<std::string> unique;
+    for (const auto& d : dirs) {
+        if (d.empty()) continue;
+        if (std::find(unique.begin(), unique.end(), d) == unique.end()) {
+            unique.push_back(d);
+        }
+    }
+    return unique;
+}
+
+std::vector<std::string> scan_for_ggufs(
+    const std::vector<std::string>& extra_dirs
+) {
+    std::vector<std::string> out;
+    for (const auto& dir : build_search_dirs(extra_dirs)) {
+        recursive_gguf(dir, out);
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
 
 std::string format_bytes(uint64_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
@@ -275,34 +300,6 @@ std::string pick_model_interactive(const std::vector<DiscoveredModel>& models) {
     if (!is_tty) {
         return pick_model_noninteractive(models);
     }
-
-    struct RawMode {
-        termios old_tio;
-        bool active = false;
-        bool enable() {
-            if (tcgetattr(STDIN_FILENO, &old_tio) != 0) return false;
-            termios new_tio = old_tio;
-            new_tio.c_lflag &= ~(ICANON | ECHO);
-            new_tio.c_cc[VMIN] = 0;
-            new_tio.c_cc[VTIME] = 0;
-            if (tcsetattr(STDIN_FILENO, TCSANOW, &new_tio) != 0) return false;
-            active = true;
-            return true;
-        }
-        void disable() {
-            if (active) {
-                tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
-                active = false;
-            }
-        }
-        ~RawMode() { disable(); }
-    };
-
-    struct CursorGuard {
-        bool hidden = false;
-        void hide() { hide_cursor(); hidden = true; }
-        ~CursorGuard() { if (hidden) show_cursor(); }
-    };
 
     RawMode raw;
     if (!raw.enable()) {
