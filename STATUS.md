@@ -10,7 +10,11 @@
 - [x] Inference engine interface
 - [x] Thread-count tuning (`-t, --threads`) wired through run/bench/validate/server/sweep
 - [x] Interactive `chat` command with streaming output, tok/s stats, and chat-template support via `llama_chat_apply_template`
-- [x] HTTP server with `/v1/completions`, `/v1/chat/completions`, `/v1/models`, and `/health`
+- [x] Interactive chat TUI as the default no-command experience, with model picker and live speed/RSS/HWM footer
+- [x] Shared model discovery between chat TUI and server TUI (`model_discovery.hpp/cpp`)
+- [x] `--model-path` CLI flag and `GIZMO_MODEL_PATH` environment variable for custom model directories
+- [x] HTTP server with `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/v1/health`, `/v1/`, and `/health`
+- [x] `serve` command (alias for `server`) for OpenAI-compatible harnesses
 - [x] Validation harness (`gizmo validate`) comparing sharded vs un-sharded logits
 - [x] Performance sweep (`gizmo sweep`) across threads, resident layers, and row size
 
@@ -66,7 +70,9 @@
 
 ### Convenience Features
 - [x] `--progress` in-place progress indicator for sharded prefill/decode (TTY only, silenced by `--verbose` or non-TTY stdout)
-- [x] Default no-command TUI with interactive model picker and inference-profile picker (`Low memory` `-r 1`, `Balanced` `-r 8`, `Fast` `--no-shard`, or custom resident-layer count)
+- [x] Default no-command chat TUI with model picker and live speed/RSS/HWM footer
+- [x] Server dashboard TUI (`gizmo tui`) with interactive model picker and inference-profile picker (`Low memory` `-r 1`, `Balanced` `-r 8`, `Fast` `--no-shard`, or custom resident-layer count)
+- [x] `--model-path` / `GIZMO_MODEL_PATH` custom model search directories
 - [ ] Automatic sweet-spot recommendation from `gizmo sweep` results
 - [ ] Built-in model download via libcurl (current `download` delegates to system `curl`/`wget`)
 - [ ] Chat-template-aware formatting in the HTTP server's `/v1/chat/completions`

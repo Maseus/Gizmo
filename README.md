@@ -1,5 +1,7 @@
 # Gizmo
 
+![Gizmo logo](gizmomainlogo.png)
+
 A C++ command-line wrapper around llama.cpp for running quantized LLMs locally, with a focus on **honest memory reporting** and a per-block sharded inference engine (prefill + decode).
 
 ## Quick Start
@@ -15,16 +17,20 @@ cmake --install build --prefix ~/.local
 # Use it from anywhere
 gizmo --help
 gizmo info
-gizmo                          # launch interactive server TUI (pick model + profile)
+gizmo                          # launch interactive chat TUI (pick model + chat live)
 gizmo run -m /path/to/model.gguf -p "Hello"
 gizmo run -m /path/to/model.gguf -p "Hello" -r 1 -n 4 --measure-ram
 gizmo run -m /path/to/model.gguf -p "Hello" --progress -n 4
+gizmo chat                     # interactive chat with model picker
 gizmo chat -m /path/to/model.gguf -n 64
+
+# Add custom model directories (also set GIZMO_MODEL_PATH=~/models:/data/ggufs)
+gizmo chat --model-path ~/models:/data/ggufs
 ```
 
 ## What Gizmo does
 
-- Wraps llama.cpp's library API with a small CLI (`run`, `chat`, `bench`, `validate`, `sweep`, `list`, `download`, `info`, `server`, `tui`).
+- Wraps llama.cpp's library API with a small CLI (`run`, `chat`, `bench`, `validate`, `sweep`, `list`, `download`, `info`, `serve`/`server`, `tui`).
 - Reports **real** memory usage (`/proc/self/status:VmRSS` / `VmHWM`) at model load, during generation, and at end-of-run. Use `--measure-ram` to print periodic VmRSS samples to stderr while generation is running.
 - Builds the llama.cpp dependency as a static library so the `gizmo` binary is self-contained.
 - Implements a **per-block sharded inference engine** for **qwen3-family** and **qwen3.5-family** models. This engine builds a separate `ggml_cgraph` per transformer block, threads the residual/KV/recurrent state, and can evict each block's weights after use. Output matches the native `llama_decode` baseline exactly for both prefill and decode on supported architectures.
@@ -41,18 +47,17 @@ gizmo chat -m /path/to/model.gguf -n 64
 | Command     | Description |
 |-------------|-------------|
 | `run`       | Run a model with a single prompt |
-| `chat`      | Interactive multi-turn chat with streaming output and tok/s stats (uses model chat template when available) |
+| `chat`      | Interactive multi-turn chat with streaming output and tok/s stats. With no `-m`, a TUI picker chooses from discovered models |
 | `bench`     | Memory/performance benchmark across prompt lengths |
 | `validate`  | Compare sharded vs un-sharded logits on a built-in prompt suite |
 | `sweep`     | Run a full generate() sweep over `-t`, `-r` and `-K` configs |
 | `list`      | Scan common model directories for `.gguf` files and print metadata |
 | `download`  | Download a model from URL using the system's `curl` or `wget` |
 | `info`      | Show system memory info |
-| `server`    | Start HTTP server (OpenAI-compatible API) |
+| `serve`     | Start HTTP server (OpenAI-compatible API); `server` is an alias |
 | `tui`       | Launch interactive server TUI (model picker + live dashboard) |
 
-When no command is given, Gizmo launches the same interactive TUI used by `gizmo tui`.
-It walks you through picking a discovered model and an inference profile (e.g. **Low memory** `-r 1`, **Balanced** `-r 8`, or **Fast** `--no-shard`) before starting the server dashboard.
+When no command is given, `gizmo` starts an interactive chat TUI: pick a discovered model, then chat with a live footer showing tok/s, RSS, HWM, and token count. Use `gizmo tui` for the server dashboard instead.
 
 ## Options
 
@@ -76,6 +81,7 @@ It walks you through picking a discovered model and an inference profile (e.g. *
 - `--sweep-max-tokens N` — `sweep`: decode tokens per configuration (default 16)
 - `--sweep-prefill-tokens N` — `sweep`: prefill tokens per configuration (default 64)
 - `-h, --help` — help
+- `--model-path <path[:path]>` — extra directories to scan for GGUF models. Also read from `GIZMO_MODEL_PATH` environment variable
 
 ## Measured RAM
 
@@ -180,14 +186,31 @@ The sharded engine is implemented and validated for **qwen3-family full-attentio
 
 > **Memory tip for Qwen3.8-27B on 16 GB hosts:** use `-r 1` to keep only one block resident at a time. A default `-r 8` run can exceed 12 GB resident and may make the host unresponsive.
 
+## HTTP Server
+
+`gizmo serve` (alias `gizmo server`) starts an OpenAI-compatible HTTP server on `--host` / `--port` (default `0.0.0.0:8080`).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET`  | `/health`     | Health check |
+| `GET`  | `/v1/health`  | Health check under `/v1/` |
+| `GET`  | `/v1/`        | Models list (OpenAI-compatible root) |
+| `GET`  | `/v1/models`  | List loaded model |
+| `POST` | `/v1/completions` | Legacy text completion |
+| `POST` | `/v1/chat/completions` | Chat completion (streaming SSE supported) |
+
+Enable CORS with `--cors`.
+
 ## Project Structure
 
 ```
 gizmo-dev/
 ├── include/
+│   ├── chat_tui.hpp
 │   ├── cli_parser.hpp
 │   ├── inference_engine.hpp
 │   ├── layer_manager.hpp
+│   ├── model_discovery.hpp
 │   ├── model_manager.hpp
 │   ├── proc_status.hpp
 │   ├── server/server.hpp
@@ -199,6 +222,8 @@ gizmo-dev/
 │   ├── model/manager.cpp
 │   ├── inference/engine.cpp
 │   ├── server/server.cpp
+│   ├── ui/chat_tui.cpp
+│   ├── ui/model_discovery.cpp
 │   ├── ui/tui.cpp
 │   └── util/proc_status.cpp
 ├── tools/sharded_engine/       # Per-block prefill/decode engine

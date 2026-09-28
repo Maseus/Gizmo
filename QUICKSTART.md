@@ -26,8 +26,11 @@ cmake --build build -j$(nproc)
 # List models
 ./build/gizmo list
 
-# Launch the interactive TUI (pick a model and an inference profile)
+# Launch the interactive chat TUI (pick a model, then chat with live speed/RSS footer)
 ./build/gizmo
+
+# Or launch the server dashboard TUI instead
+./build/gizmo tui
 
 # Run a model with a prompt
 ./build/gizmo run -m /path/to/model.gguf -p "Hello!"
@@ -55,11 +58,19 @@ cmake --build build -j$(nproc)
 # Sweep configs
 ./build/gizmo sweep -m /path/to/Qwen3-4B-Q4_K_M.gguf
 
-# Interactive chat
+# Interactive chat (with model picker when no -m is given)
+./build/gizmo chat
 ./build/gizmo chat -m /path/to/model.gguf -n 256
 
-# HTTP server
+# Add custom model directories (colon-separated; also use GIZMO_MODEL_PATH)
+./build/gizmo chat --model-path ~/models:/data/ggufs
+
+# HTTP server (OpenAI-compatible; `serve` and `server` both work)
+./build/gizmo serve -m /path/to/model.gguf --port 8080
 ./build/gizmo server -m /path/to/model.gguf --port 8080
+
+curl http://127.0.0.1:8080/v1/health
+curl http://127.0.0.1:8080/v1/models
 ```
 
 ## Current Status
@@ -74,7 +85,10 @@ cmake --build build -j$(nproc)
 - ✅ Chat command with chat-template support
 - ✅ qwen3.5-family / qwen3.8 sharded-engine support (validated on 0.8B–27B)
 - ✅ `--progress` in-place indicator for sharded prefill/decode
-- ✅ Interactive default TUI with model picker + inference-profile picker
+- ✅ Interactive default chat TUI with model picker + live speed/RSS footer
+- ✅ Shared model discovery used by chat TUI and server TUI
+- ✅ `--model-path` / `GIZMO_MODEL_PATH` for custom model search directories
+- ✅ `serve` command alias and `/v1/health`, `/v1/` endpoints
 - ⏳ Built-in model download via libcurl
 
 ## Architecture
@@ -82,9 +96,11 @@ cmake --build build -j$(nproc)
 ```
 gizmo-dev/
 ├── include/           # Header files
+│   ├── chat_tui.hpp
 │   ├── cli_parser.hpp
 │   ├── inference_engine.hpp
 │   ├── layer_manager.hpp
+│   ├── model_discovery.hpp
 │   ├── model_manager.hpp
 │   ├── proc_status.hpp
 │   ├── server/server.hpp
@@ -96,6 +112,8 @@ gizmo-dev/
 │   ├── model/manager.cpp
 │   ├── inference/engine.cpp
 │   ├── server/server.cpp
+│   ├── ui/chat_tui.cpp
+│   ├── ui/model_discovery.cpp
 │   ├── ui/tui.cpp
 │   └── util/proc_status.cpp
 ├── tools/sharded_engine/  # Per-block prefill/decode engine

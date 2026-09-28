@@ -15,8 +15,9 @@ enum class CommandType {
     List,
     Download,
     Info,
-    Server,
-    Tui,      // interactive server launcher (default when no command is given)
+    Server,   // alias for Serve; kept for backwards compatibility
+    Serve,    // HTTP server (OpenAI-compatible API)
+    Tui,      // interactive server launcher / dashboard
     Help,
     Unknown
 };
@@ -53,6 +54,9 @@ struct CliOptions {
 
     // Download options
     std::string download_url;     // URL to download from
+
+    // Default model search directories (colon-separated on CLI).
+    std::string model_path;       // extra directories to scan for GGUFs
 };
 
 class CliParser {

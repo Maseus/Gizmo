@@ -8,14 +8,14 @@ A working C++ application that integrates with llama.cpp for low-resource LLM in
 
 1. **CLI Parser** - Full command-line interface:
    - `run` - Run model with prompt
-   - `chat` - Interactive chat mode with streaming output and tok/s stats (uses model chat template when available)
+   - `chat` - Interactive chat mode with streaming output and tok/s stats; with no `-m`, a TUI model picker is shown (uses model chat template when available)
    - `bench` - Memory/performance benchmark
    - `validate` - Compare sharded vs un-sharded logits
    - `sweep` - Matrix sweep over threads, resident layers, and row size
    - `list` - Scan common model directories and list GGUFs with metadata
    - `download` - Download models using system `curl`/`wget`
    - `info` - System info
-   - `server` / `tui` - HTTP server and interactive TUI
+   - `serve` / `server` / `tui` - HTTP server (OpenAI-compatible) and interactive server TUI
    - Help system with layer sharding documentation
 
 2. **Layer Manager** - Memory tracking and calculations
@@ -115,6 +115,8 @@ gizmo-dev/
 │   ├── model/manager.cpp     # Model file handling + GGUF parsing
 │   ├── inference/engine.cpp  # llama.cpp integration + sharded prefill/decode
 │   ├── server/server.cpp     # HTTP server
+│   ├── ui/chat_tui.cpp       # Interactive chat TUI
+│   ├── ui/model_discovery.cpp # Shared model discovery
 │   ├── ui/tui.cpp            # Interactive server TUI
 │   └── util/proc_status.cpp  # /proc/self/status helpers
 ├── tools/sharded_engine/
@@ -123,9 +125,11 @@ gizmo-dev/
 │   ├── shard_block.cpp       # qwen3 block builders
 │   └── tail_graph.cpp        # Final norm + LM head
 ├── include/
+│   ├── chat_tui.hpp
 │   ├── cli_parser.hpp
 │   ├── inference_engine.hpp
 │   ├── layer_manager.hpp
+│   ├── model_discovery.hpp
 │   ├── model_manager.hpp
 │   ├── proc_status.hpp
 │   ├── server/server.hpp

@@ -48,6 +48,8 @@ add_executable(gizmo
     src/util/proc_status.cpp
     src/server/server.cpp
     src/ui/tui.cpp
+    src/ui/model_discovery.cpp
+    src/ui/chat_tui.cpp
 )
 
 target_include_directories(gizmo PRIVATE

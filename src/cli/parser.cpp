@@ -44,6 +44,7 @@ CommandType CliParser::parse_command(const std::string& cmd) const {
     if (cmd == "download") return CommandType::Download;
     if (cmd == "info") return CommandType::Info;
     if (cmd == "server") return CommandType::Server;
+    if (cmd == "serve") return CommandType::Serve;
     if (cmd == "tui") return CommandType::Tui;
     if (cmd == "help" || cmd == "--help" || cmd == "-h") return CommandType::Help;
     return CommandType::Unknown;
@@ -133,6 +134,8 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
             options.cors = true;
         } else if (arg == "--url") {
             if (i + 1 < argc) options.download_url = argv[++i];
+        } else if (arg == "--model-path") {
+            if (i + 1 < argc) options.model_path = argv[++i];
         }
     }
 
@@ -152,7 +155,7 @@ CliOptions CliParser::parse(int argc, char* argv[]) {
     CliOptions options;
 
     if (argc < 2) {
-        options.command = CommandType::Tui;  // default: interactive server launcher
+        options.command = CommandType::Chat;  // default: interactive chat TUI
         return options;
     }
 
@@ -192,7 +195,7 @@ Gizmo - Low-resource LLM inference with layer sharding
 Usage: gizmo [command] [options]
 
 Commands:
-  (none)    Launch the interactive server TUI (model picker + live dashboard)
+  (none)    Launch the interactive chat TUI (model picker + Claude Code-like REPL)
   run       Run a model with a single prompt
   chat      Interactive chat mode with streaming output and speed stats
   bench     Run memory/performance benchmark across prompt lengths
@@ -201,7 +204,9 @@ Commands:
   list      List downloaded models in common model directories
   download  Download a model from URL using curl/wget
   info      Show system memory info
-  server    Start HTTP server (OpenAI-compatible API) directly
+  serve     Start HTTP server (OpenAI-compatible API)
+  server    Alias for serve (backwards compatibility)
+  tui       Launch interactive server dashboard (model picker + live dashboard)
   help      Show this help message
 
 Options:
@@ -237,6 +242,8 @@ Options:
       --server-threads <N>      Server worker threads (default: 4)
       --cors                    Enable CORS headers
       --url <url>               Download URL (for download command)
+      --model-path <path[:path]>  Extra directories to scan for GGUF models
+                                    (also read from GIZMO_MODEL_PATH env var)
   -h, --help                    Show this help message
 
 Layer Sharding:
@@ -262,9 +269,10 @@ Examples:
   gizmo sweep -m model.gguf -r 1,4,8,16 -K 1,2,4 --json
   gizmo sweep -m model.gguf -r 4 -K 1 -t 2,4,8
   gizmo info
-  gizmo server -m model.gguf --port 8080
-  gizmo server -m model.gguf -r 4 --cors
+  gizmo serve -m model.gguf --port 8080
+  gizmo serve -m model.gguf -r 4 --cors
   gizmo chat -m model.gguf -n 256
+  gizmo chat --model-path ~/models
 )";
 }
 

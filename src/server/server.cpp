@@ -117,6 +117,8 @@ void HttpServer::start() {
     using httplib::Request;
     using httplib::Response;
     svr_->Get("/health", [this](const Request& req, Response& res) { handle_health(req, res); });
+    svr_->Get("/v1/health", [this](const Request& req, Response& res) { handle_health(req, res); });
+    svr_->Get("/v1/", [this](const Request& req, Response& res) { handle_models(req, res); });
     svr_->Get("/v1/models", [this](const Request& req, Response& res) { handle_models(req, res); });
     svr_->Post("/v1/completions", [this](const Request& req, Response& res) { handle_completions(req, res); });
     svr_->Post("/v1/chat/completions", [this](const Request& req, Response& res) { handle_chat_completions(req, res); });

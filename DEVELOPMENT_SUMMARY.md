@@ -52,14 +52,14 @@ With sharding enabled the GGUF is mmap'd but **not** prefaulted, so the initial 
 
 ✅ **CLI Parser** - All commands wired:
 - `gizmo run -m model.gguf -p "..." -r 1 -n 4`
-- `gizmo chat -m model.gguf -r 1`
+- `gizmo chat` (interactive chat TUI with model picker) or `gizmo chat -m model.gguf -r 1`
 - `gizmo list`
 - `gizmo download -u <url>` (delegates to system curl/wget)
 - `gizmo info`
 - `gizmo validate -m model.gguf`
 - `gizmo sweep -m model.gguf`
-- `gizmo server -m model.gguf --port 8080`
-- `gizmo tui`
+- `gizmo serve -m model.gguf --port 8080` (alias `server`)
+- `gizmo tui` (server dashboard)
 
 ✅ **Inference Engine** - llama.cpp integration:
 - Model loading with CPU-only mmap
@@ -88,9 +88,11 @@ With sharding enabled the GGUF is mmap'd but **not** prefaulted, so the initial 
 ```
 gizmo-dev/
 ├── include/
+│   ├── chat_tui.hpp
 │   ├── cli_parser.hpp
 │   ├── inference_engine.hpp
 │   ├── layer_manager.hpp
+│   ├── model_discovery.hpp
 │   ├── model_manager.hpp
 │   ├── proc_status.hpp
 │   ├── server/server.hpp
@@ -102,6 +104,8 @@ gizmo-dev/
 │   ├── model/manager.cpp
 │   ├── inference/engine.cpp
 │   ├── server/server.cpp
+│   ├── ui/chat_tui.cpp
+│   ├── ui/model_discovery.cpp
 │   ├── ui/tui.cpp
 │   └── util/proc_status.cpp
 ├── tools/sharded_engine/

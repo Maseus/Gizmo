@@ -1,5 +1,7 @@
+#include "chat_tui.hpp"
 #include "cli_parser.hpp"
 #include "inference_engine.hpp"
+#include "model_discovery.hpp"
 #include "model_manager.hpp"
 #include "proc_status.hpp"
 #include "server/server.hpp"
@@ -29,20 +31,69 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Parse a colon-separated list of directories (e.g. "~/models:/data/ggufs").
+// Empty entries are ignored.
+std::vector<std::string> parse_colon_dirs(const std::string& s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == ':') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+std::string join_colon_dirs(const std::vector<std::string>& dirs) {
+    std::string out;
+    for (size_t i = 0; i < dirs.size(); ++i) {
+        if (i > 0) out += ':';
+        out += dirs[i];
+    }
+    return out;
+}
+
+// Build the ordered list of model-search directories from:
+// 1) --model-path CLI flag, 2) GIZMO_MODEL_PATH env var, 3) built-in defaults.
+std::vector<std::string> model_search_dirs(const std::string& cli_model_path) {
+    std::vector<std::string> dirs;
+    auto cli_dirs = parse_colon_dirs(cli_model_path);
+    dirs.insert(dirs.end(), cli_dirs.begin(), cli_dirs.end());
+
+    const char* env = getenv("GIZMO_MODEL_PATH");
+    if (env) {
+        auto env_dirs = parse_colon_dirs(env);
+        dirs.insert(dirs.end(), env_dirs.begin(), env_dirs.end());
+    }
+
+    const char* home = getenv("HOME");
+    if (home) {
+        dirs.push_back(std::string(home) + "/.local/share/gizmo/models");
+        dirs.push_back(std::string(home) + "/.lmstudio/models");
+        dirs.push_back(std::string(home) + "/.ollama/models/blobs");
+    }
+    dirs.push_back("./models");
+
+    // De-duplicate while preserving order.
+    std::vector<std::string> unique;
+    for (const auto& d : dirs) {
+        if (std::find(unique.begin(), unique.end(), d) == unique.end()) {
+            unique.push_back(d);
+        }
+    }
+    return unique;
+}
+
 // Scan a set of common model directories for GGUF files, skipping helper
 // files (mmproj, mtp, embeddings, vision tensors).
 std::vector<std::string> scan_for_ggufs() {
-    std::vector<std::string> candidates;
-    const char* home = getenv("HOME");
-    if (home) {
-        candidates.push_back(std::string(home) + "/.local/share/gizmo/models");
-        candidates.push_back(std::string(home) + "/.lmstudio/models");
-        candidates.push_back(std::string(home) + "/.ollama/models/blobs");
-    }
-    candidates.push_back("./models");
-
+    auto dirs = model_search_dirs("");
     std::vector<std::string> out;
-    for (const auto& dir : candidates) {
+    for (const auto& dir : dirs) {
         if (!fs::exists(dir) || !fs::is_directory(dir)) {
             continue;
         }
@@ -1164,8 +1215,12 @@ int main(int argc, char* argv[]) {
 
         case gizmo::CommandType::Chat: {
             if (options.model.empty()) {
-                std::cerr << "Error: --model required for chat\n";
-                return 1;
+                // Launch the interactive chat TUI with a model picker.
+                auto dirs = model_search_dirs(options.model_path);
+                return gizmo::run_chat_tui("",
+                                           join_colon_dirs(dirs),
+                                           options.max_tokens,
+                                           options.threads.empty() ? 4 : options.threads[0]);
             }
             return do_chat(options.model,
                            options.resident_layers.empty() ? 8 : options.resident_layers[0],
@@ -1241,6 +1296,8 @@ int main(int argc, char* argv[]) {
             return gizmo::run_server_tui(options.host, options.port, options.cors);
         }
 
+        case gizmo::CommandType::Serve:
+            // fallthrough
         case gizmo::CommandType::Server: {
             if (options.model.empty()) {
                 std::cerr << "Error: --model required for server\n";
