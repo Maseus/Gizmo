@@ -1,5 +1,5 @@
 # Gizmo inference server - multi-stage Docker build.
-# Produces a small image with the static gizmo binary and system CA certs.
+# Produces a small image with the single-file gizmo binary and system CA certs.
 
 FROM ubuntu:22.04 AS builder
 

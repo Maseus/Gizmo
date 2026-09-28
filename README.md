@@ -10,7 +10,7 @@ A C++ command-line wrapper around llama.cpp for running quantized LLMs locally, 
 # Install the latest release binary (requires ~/.local/bin on PATH)
 curl -fsSL https://raw.githubusercontent.com/Maseus/Gizmo/master/install.sh | bash
 
-# Or build from source (uses CMake; produces a static binary)
+# Or build from source (uses CMake; produces a single-file `gizmo` binary)
 cmake -S . -B build -DCMAKE_BUILD_TYPE Release
 cmake --build build -j$(nproc)
 
@@ -291,7 +291,7 @@ gizmo-dev/
 │   ├── shard_block.cpp
 │   └── tail_graph.cpp
 ├── llama.cpp/                  # Submodule (built static)
-├── build/gizmo                 # Static binary
+├── build/gizmo                 # Single-file binary
 ├── CMakeLists.txt              # Build system
 └── README.md
 ```
