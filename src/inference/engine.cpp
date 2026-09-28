@@ -514,18 +514,19 @@ bool InferenceEngine::generate_stream(
         return false;
     }
 
-    const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(llama_context_));
-    if (n_tokens >= n_ctx) {
+    // Honor per-request context-size requests when validating the prompt and
+    // rebuilding the context.  Reject early if the prompt does not fit in the
+    // requested (or current) context window.
+    const int32_t n_ctx_current = static_cast<int32_t>(llama_n_ctx(llama_context_));
+    const int32_t n_ctx_effective =
+        config.context_size > 0 ? config.context_size : n_ctx_current;
+    if (n_tokens >= n_ctx_effective) {
         std::cerr << "Error: Prompt is too long (" << n_tokens
-                  << " tokens, context size " << n_ctx << ")\n";
+                  << " tokens, context size " << n_ctx_effective << ")\n";
         return false;
     }
 
-    // Honor per-request context-size requests by rebuilding the context if
-    // the requested size differs from the current one. Callers typically
-    // reset the KV cache before generation, so this is safe.
-    if (config.context_size > 0 &&
-        static_cast<int32_t>(llama_n_ctx(llama_context_)) != config.context_size) {
+    if (config.context_size > 0 && n_ctx_current != config.context_size) {
         llama_free(llama_context_);
         llama_context_ = nullptr;
         struct llama_context_params ctx_params = llama_context_default_params();
