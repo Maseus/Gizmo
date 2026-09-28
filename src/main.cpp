@@ -1058,7 +1058,8 @@ int main(int argc, char* argv[]) {
 
         case gizmo::CommandType::List: {
             std::cout << "Available models:\n";
-            auto paths = gizmo::scan_for_ggufs();
+            auto paths = gizmo::scan_for_ggufs(
+                gizmo::build_search_dirs(gizmo::parse_colon_dirs(options.extra_model_dirs)));
             if (paths.empty()) {
                 std::cout << "(No GGUF models found in ~/.local/share/gizmo/models, "
                           << "~/.lmstudio/models, ~/.ollama/models/blobs, or ./models)\n";
