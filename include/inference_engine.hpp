@@ -67,6 +67,11 @@ public:
     // per-row progress and argmax logging.
     void set_verbose(bool verbose) { verbose_ = verbose; }
 
+    // Show a concise in-place progress indicator during sharded prefill
+    // and decode. Independent of verbose_; useful for large models where
+    // the user wants feedback without the full per-row diagnostic dump.
+    void set_progress(bool progress) { progress_ = progress; }
+
     // Set the number of CPU threads for both the native llama.cpp context
     // (llama_set_n_threads) and the sharded CPU backend. Must be called
     // before enable_sharded_engine() to take effect on the sharded path;
@@ -159,7 +164,6 @@ public:
 
 private:
     bool initialized_;
-    bool verbose_ = false;
     std::string model_path_;
     int32_t layers_loaded_;
     llama_context* llama_context_;
@@ -168,6 +172,8 @@ private:
     // Sharded-engine state. Built in enable_sharded_engine(), freed
     // in the destructor. Both pointers may be null when the un-sharded
     // path is selected (--no-shard).
+    bool                 verbose_ = false;
+    bool                 progress_ = false;
     bool                 use_sharded_engine_ = false;
     bool                 sharded_evict_weights_ = false;
     int32_t              sharded_resident_layers_ = 1;  // unused in Phase 6

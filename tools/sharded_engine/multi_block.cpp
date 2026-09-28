@@ -16,8 +16,24 @@
 #include "llama-memory-hybrid.h"
 
 #include <algorithm>
+#include <unistd.h>
 
 namespace {
+
+// Print or overwrite a single-line progress indicator. Safe to call
+// repeatedly: it uses \r to stay on one line and is skipped when stdout
+// is not a TTY (so pipelines / server logs are not polluted).
+void print_progress(const char* stage, int completed, int total) {
+    if (!isatty(STDOUT_FILENO)) return;
+    std::printf("\r[%s] block %2d/%d", stage, completed, total);
+    std::fflush(stdout);
+}
+
+void clear_progress_line() {
+    if (!isatty(STDOUT_FILENO)) return;
+    std::printf("\r%-60s\r", "");
+    std::fflush(stdout);
+}
 // The memory context returned by llama_kv_cache_init_for_batch/decode is
 // either a plain llama_kv_cache_context (pure-attention models like Qwen3)
 // or a llama_memory_hybrid_context wrapping an attention KV cache plus a
@@ -298,7 +314,9 @@ multi_block_result_t run_multi_block(
     int                             row_size,
     llama_memory_context_i *        mctx,
     int                             pos_first,
-    bool                            verbose
+    bool                            verbose,
+    bool                            progress,
+    const char *                    stage
 ) {
     multi_block_result_t result{};
     const int n_layer = (int)model->hparams.n_layer();
@@ -686,9 +704,16 @@ multi_block_result_t run_multi_block(
                 std::printf("[sharded]   page-out: %.1f MB\n",
                             (double)total_evicted / (1024.0 * 1024.0));
             }
+        } else if (progress) {
+            const int completed = std::min(il_start + K_this, n_layer);
+            print_progress(stage, completed, n_layer);
         }
 
         ggml_free(row_ctx);
+    }
+
+    if (progress && !verbose) {
+        clear_progress_line();
     }
 
     // ---- Tail: rms_norm + lm_head, using the carrier as input.

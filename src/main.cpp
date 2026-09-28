@@ -335,6 +335,7 @@ static int do_validate(
     int32_t row_size,
     int32_t threads,
     bool verbose,
+    bool progress,
     bool json_output,
     bool argmax_only,
     float max_diff_threshold,
@@ -371,6 +372,10 @@ static int do_validate(
         out_results.clear();
         out_results.reserve(prompts.size());
         for (const auto& prompt : prompts) {
+            // Each prompt must start from an empty KV/recurrent cache so the
+            // logits match a fresh llama_decode run. Without this reset the
+            // previous prompt's K/V or SSM state leaks into the next case.
+            engine.reset_for_next_run();
             std::vector<float> logits;
             if (engine.validate_prefill(prompt, logits) != 0) {
                 if (verbose) {
@@ -416,6 +421,7 @@ static int do_validate(
     // full model and gives the un-sharded reference logits.
     gizmo::InferenceEngine baseline_engine;
     baseline_engine.set_verbose(verbose);
+    baseline_engine.set_progress(progress);
     baseline_engine.set_threads(threads);
     if (!baseline_engine.initialize(model_path, /*layer_shard_lazy=*/false)) {
         std::cerr << "[validate] failed to load model (baseline): " << model_path << "\n";
@@ -431,6 +437,7 @@ static int do_validate(
     // Sharded: reload with lazy mmap and enable the per-block engine.
     gizmo::InferenceEngine sharded_engine;
     sharded_engine.set_verbose(verbose);
+    sharded_engine.set_progress(progress);
     sharded_engine.set_threads(threads);
     if (!sharded_engine.initialize(model_path, /*layer_shard_lazy=*/true)) {
         std::cerr << "[validate] failed to load model (sharded): " << model_path << "\n";
@@ -463,6 +470,7 @@ static int do_validate(
         // Need logits to compute diffs. Re-run the sharded prefill for
         // this prompt and keep the logits. This is the simplest path
         // without adding a temp member to validate_case_t.
+        sharded_engine.reset_for_next_run();
         std::vector<float> shard_logits;
         if (sharded_engine.validate_prefill(s.prompt, shard_logits) != 0) {
             s.pass = false;
@@ -470,8 +478,9 @@ static int do_validate(
             continue;
         }
 
-        // Re-run baseline to get its logits for diff. The baseline engine
-        // still has the model loaded; reset KV each time.
+        // Re-run baseline to get its logits for diff. Reset the cache
+        // before every prompt so the baseline matches a fresh context.
+        baseline_engine.reset_for_next_run();
         std::vector<float> base_logits;
         if (baseline_engine.validate_prefill(s.prompt, base_logits) != 0) {
             s.pass = false;
@@ -597,10 +606,12 @@ static int do_chat(
     int32_t max_tokens,
     bool measure_ram,
     int32_t measure_interval_ms,
-    bool verbose
+    bool verbose,
+    bool progress
 ) {
     gizmo::InferenceEngine engine;
     engine.set_verbose(verbose);
+    engine.set_progress(progress);
     engine.set_threads(threads);
     if (!engine.initialize(model_path, /*layer_shard_lazy=*/!no_shard)) {
         std::cerr << "Failed to initialize inference engine\n";
@@ -1165,7 +1176,8 @@ int main(int argc, char* argv[]) {
                            options.max_tokens,
                            options.measure_ram,
                            options.measure_interval_ms,
-                           options.verbose);
+                           options.verbose,
+                           options.progress);
         }
 
         case gizmo::CommandType::Bench: {
@@ -1205,7 +1217,8 @@ int main(int argc, char* argv[]) {
                                options.no_evict,
                                options.row_size.empty() ? 1 : options.row_size[0],
                                options.threads.empty() ? 4 : options.threads[0],
-                               options.verbose, options.json_output,
+                               options.verbose, options.progress,
+                               options.json_output,
                                options.argmax_only,
                                options.max_diff_threshold,
                                options.mean_diff_threshold);
@@ -1313,6 +1326,7 @@ int main(int argc, char* argv[]) {
 
             gizmo::InferenceEngine engine;
             engine.set_verbose(options.verbose);
+            engine.set_progress(options.progress);
             engine.set_threads(options.threads.empty() ? 4 : options.threads[0]);
             if (!engine.initialize(options.model, /*layer_shard_lazy=*/!options.no_shard)) {
                 std::cerr << "Failed to initialize inference engine\n";

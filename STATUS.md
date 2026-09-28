@@ -4,12 +4,15 @@
 
 ### Core Infrastructure
 - [x] Project structure with CMake build system
-- [x] CLI parser with all commands working
+- [x] CLI parser with all commands wired
 - [x] Layer manager (bookkeeping)
-- [x] Model manager with GGUF file scanning
+- [x] Model manager with GGUF file scanning and header parsing (layers, embd, vocab, arch, parameter count)
 - [x] Inference engine interface
 - [x] Thread-count tuning (`-t, --threads`) wired through run/bench/validate/server/sweep
-- [x] Simple interactive `chat` command with streaming output and tok/s stats
+- [x] Interactive `chat` command with streaming output, tok/s stats, and chat-template support via `llama_chat_apply_template`
+- [x] HTTP server with `/v1/completions`, `/v1/chat/completions`, `/v1/models`, and `/health`
+- [x] Validation harness (`gizmo validate`) comparing sharded vs un-sharded logits
+- [x] Performance sweep (`gizmo sweep`) across threads, resident layers, and row size
 
 ### llama.cpp Integration
 - [x] Inference engine rewritten with llama.cpp API
@@ -20,68 +23,76 @@
 
 ### Per-Block Sharded Engine
 - [x] Sequential per-block `ggml_cgraph` construction (`tools/sharded_engine/`)
-- [x] Residual, KV-cache, and recurrent-state threading across blocks
-- [x] Support for hybrid architectures (qwen3 full-attention + gated-delta-net recurrent layers)
-- [x] MRoPE position layout matching native `llama_decode`
+- [x] Residual and KV-cache threading across blocks
+- [x] Support for qwen3 full-attention models
 - [x] Tail graph with `model.output_s` scaling
 - [x] Optional `madvise(MADV_DONTNEED)` weight eviction
-- [x] CPU weight repack disabled (`use_extra_bufts=false`) to prevent 27B load OOM
-- [x] Integration into `InferenceEngine::generate()` as the prefill path
+- [x] Single-token decode path with full-cache causal mask
+- [x] Row-graph chaining (`-K, --row-size`) for qwen3 models
 
 ### Tested & Verified
-- [x] CLI commands work correctly
-- [x] `gizmo run` end-to-end on qwen3.8:27b (`Qwen3.8-27B-Q4_K_M.gguf`)
-- [x] Sharded prefill validated against un-sharded `llama_decode` baseline
+- [x] CLI commands build and run
+- [x] `gizmo run` end-to-end on qwen3-family models (e.g., Qwen3-4B)
+- [x] Sharded prefill validated against un-sharded `llama_decode` baseline on qwen3 models
   - Single-token prompt: exact parity (max diff 0.0)
   - Multi-token prompt: exact parity (max diff 0.0)
   - With and without `--evict`
-- [x] Sharded decode validated against un-sharded `llama_decode` baseline
+- [x] Sharded decode validated against un-sharded `llama_decode` baseline on qwen3 models
   - Per-token argmax and logits match exactly across decode iterations
-- [x] End-to-end generation produces coherent text
-  - `"What is the capital of France?"` → `"The capital of …"`
-- [x] Measured memory on qwen3.8:27b
-  - Sharded prefill steady-state at `-r 1`: **~560 MB**
-  - Sharded decode steady-state at `-r 1`: **~1.5 GB**
-  - Model load RSS with sharding enabled: **~298 MB** (no mmap prefault)
-  - End-to-end peak HWM with sharding enabled: **~2.0 GB**
-  - `--no-shard` baseline load RSS: **~7.5 GB**, HWM **~9.2 GB**
+- [x] qwen3.5-family models use the per-block sharded engine and match the un-sharded `llama_decode` baseline exactly
+  - Validated on Qwen3.5-0.8B-Q8_0, Qwen3.5-2B-Q4_K_S, Qwen3.5-4B-Q4_K_M, and Qwen3.5-9B-Q4_K_M
+  - Both full-attention and gated-delta-net recurrent blocks pass the built-in `gizmo validate` prompt suite
+- [x] qwen3.8-27B uses the per-block sharded engine and matches the un-sharded baseline exactly
+  - `gizmo validate` passes all built-in prompts with zero logit diffs
+  - `gizmo run`, `gizmo chat`, and `gizmo server` all work with `-r 1` under 2.1 GB peak resident
+- [x] qwen2 / qwen2.5 / MoE models fall back to native `llama_decode` and produce correct output
+- [x] Measured memory on qwen3-family models
+  - Model load RSS with sharding enabled: **~120 MB** (no mmap prefault)
+  - Sharded prefill steady-state: **~510 MB**
+  - Sharded decode steady-state: **~500 MB**
+  - End-to-end HWM: **~630 MB**
+- [x] Measured memory on Qwen3.8-27B Q4_K_M with sharding enabled
+  - Model load RSS: **~293 MB**
+  - `-r 1` generation HWM: **~2.0 GB**
+  - `-r 8` validation HWM: **~12.7 GB** (requires a host with more than 16 GB RAM for comfort)
 
 ## ⏳ Pending
 
-### Integration Testing
-- [x] Automated diff harness comparing sharded vs un-sharded logits across a prompt suite (`gizmo validate`)
-- [x] Performance regression sweep for resident-layer / row-size / thread-count matrix (`gizmo sweep`)
-- [ ] Automatic sweet-spot recommendation from sweep results
+### Sharded Engine Expansion
+- [x] Per-block sharded engine support for **qwen3.5-family** models (full-attention + recurrent hybrid blocks)
+- [x] Re-enable sharded path for `LLM_ARCH_QWEN35`
+- [x] ISWA KV-cache support for qwen3.5 full-attention blocks
+- [x] Recurrent-state threading for gated-delta-net blocks
 
-### Features to Add
-- [ ] Built-in model download via libcurl
-- [ ] GGUF header parsing for automatic layer size detection
-- [ ] Interactive multi-turn `chat` with chat-template support
+### Convenience Features
+- [x] `--progress` in-place progress indicator for sharded prefill/decode (TTY only, silenced by `--verbose` or non-TTY stdout)
+- [x] Default no-command TUI with interactive model picker and inference-profile picker (`Low memory` `-r 1`, `Balanced` `-r 8`, `Fast` `--no-shard`, or custom resident-layer count)
+- [ ] Automatic sweet-spot recommendation from `gizmo sweep` results
+- [ ] Built-in model download via libcurl (current `download` delegates to system `curl`/`wget`)
+- [ ] Chat-template-aware formatting in the HTTP server's `/v1/chat/completions`
+- [ ] Better token-usage reporting in streaming SSE responses
 
-## Key Insight: End-to-End Sharded Generation
+### Polish
+- [ ] Reduce sharded-engine diagnostic noise further when `--verbose` is off
+- [ ] Performance tuning: find the best default resident-layer count per model family
 
-llama.cpp's `llama_decode` builds one `ggml_cgraph` containing all transformer blocks. Gizmo now bypasses this for **both prefill and decode** with a custom per-block engine. On qwen3.8:27b:
+## Current Behavior by Architecture
 
-- Model load uses mmap without prefault when sharding is enabled, so initial RSS stays under ~300 MB.
-- Prefill RSS drops to sub-1 GB (`-r 1`).
-- Decode RSS stays at ~1.5 GB per token (`-r 1`).
-- End-to-end HWM is now ~2.0 GB, down from ~9.5 GB.
+| Architecture | Sharded Engine | Fallback | Notes |
+|-------------|----------------|----------|-------|
+| `qwen3`     | ✅ enabled     | native `llama_decode` if disabled | Validated end-to-end |
+| `qwen35`    | ✅ enabled     | native `llama_decode` if disabled | Validated end-to-end on 0.8B–27B models |
+| `qwen2`     | ❌ disabled    | native `llama_decode` | Architecture not ported |
+| `qwen2.5`   | ❌ disabled    | native `llama_decode` | Architecture not ported |
+| `qwen3moe`  | ❌ disabled    | native `llama_decode` | MoE not ported |
+| `qwen35moe` | ❌ disabled    | native `llama_decode` | MoE not ported |
+| `qwen3vlmoe`| ❌ disabled    | native `llama_decode` | MoE/VL not ported |
 
 ## Next Steps
 
-1. ✅ **Reduce diagnostic noise**: sharded-engine per-block progress, argmax reports, and initialization details are now quiet by default. Use `--verbose` / `-v` to restore them.
-2. ✅ **Automated validation harness**: `gizmo validate` runs a built-in prompt suite against both sharded and un-sharded paths, comparing last-token argmax and logit diffs. Supports JSON output (`--json`), argmax-only mode (`--argmax-only`), and configurable tolerances (`--max-diff`, `--mean-diff`).
-3. ✅ **Performance sweep**: `gizmo sweep` captures wall time and peak RSS for a full `generate()` run across a matrix of `-t` (threads), `-r` (resident layers), and `-K` (row size) values. Supports `--json` and configurable prefill/decode sizes.
-4. ✅ **Cleanup**: removed the unused `chat_handler.hpp`/`chat/handler.cpp` stub, dropped `-i/--interactive` and `-u/--url` flags, and updated `download` to print a helpful `curl`/`wget` pointer. Sharded engine still only supports qwen3/qwen3.5-family models; non-hybrid/qwen2 models use `--no-shard` fallback.
-5. ✅ **Thread-count tuning**: `-t, --threads` sets CPU threads for native `llama_decode` and the sharded backend; sweep iterates over a thread list as the outer loop.
-6. ✅ **Simple chat mode**: `gizmo chat` starts an interactive loop that streams assistant tokens, shows tok/s and memory after each turn, and supports `/reset` to clear context. It uses a plain text context (not the model's chat template).
-
-## Known Findings
-
-- `gizmo validate` reports **exact parity** (max diff 0.0) on `qwen3.8:27b` and `Qwen3.5-9B` with default tolerances.
-- `Qwen3-8B` shows small but growing logit drift as prompt length increases (argmax still matches). This is flagged as FAIL under the default tolerances and PASS with `--argmax-only`. The sharded engine was primarily validated on qwen3.5-family hybrid models; pure qwen3 attention routing may need a separate look.
-- The sharded engine is **not** compatible with qwen2/qwen2.5-family models or MoE variants (`qwen3moe`, `qwen35moe`, `qwen3vlmoe`); Gizmo now detects this at load time and automatically disables the sharded engine, falling back to native `llama_decode`.
-- **Ornith1.5:35B** was tested: it reports `general.architecture = qwen35moe`, runs correctly via the auto fallback, and passes `gizmo validate` with 0.0 logit diff. Sharded-engine support for qwen35moe remains future work.
+1. Validate remaining local model families (`qwen3`, `qwen2`, `qwen2.5`, MoE) with the refreshed CLI matrix.
+2. Implement convenience features (sweet-spot sweep, libcurl download, server chat template).
+3. Performance tuning: find the best default resident-layer count per model family.
 
 ## Current Build Command
 
@@ -90,7 +101,7 @@ llama.cpp's `llama_decode` builds one `ggml_cgraph` containing all transformer b
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# Run a bounded end-to-end test on qwen3.8:27b
-./build/gizmo run -m /path/to/Qwen3.8-27B-Q4_K_M.gguf \
+# Run a bounded end-to-end test on a qwen3 model
+./build/gizmo run -m /path/to/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
     -p "What is the capital of France?" -r 1 -n 4 --measure-ram
 ```

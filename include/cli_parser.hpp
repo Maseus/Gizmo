@@ -39,6 +39,7 @@ struct CliOptions {
     int32_t sweep_max_tokens = 16;         // sweep: decode tokens per configuration
     int32_t sweep_prefill_tokens = 64;     // sweep: prefill tokens per configuration
     bool verbose = false;         // print sharded-engine diagnostic details
+    bool progress = false;        // show in-place prefill/decode progress indicator
     bool json_output = false;     // emit validation results as JSON
     bool argmax_only = false;     // validate only argmax parity, ignore logit diffs
     float max_diff_threshold = 1e-4f;   // validation: max abs logit diff tolerance

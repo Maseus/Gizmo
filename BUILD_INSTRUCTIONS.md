@@ -2,100 +2,106 @@
 
 ## Current Status
 
-The basic Gizmo CLI builds and runs with the simple Makefile:
+Gizmo uses **CMake** to build both llama.cpp (as a static submodule library) and the `gizmo` executable. The old Makefile is kept for reference but does not link llama.cpp.
 
-```bash
-make
-./build/gizmo --help
-```
+## Prerequisites
 
-This gives you:
-- ✅ Working CLI with all commands
-- ✅ Layer sharding math (memory calculations)
-- ✅ Model specs for qwen3.8:27b
+- C++17 compatible compiler (GCC 8+ or Clang 7+)
+- CMake 3.14+
+- Linux (primary target)
 
-## Building with llama.cpp Integration
-
-To get actual inference working, you need cmake:
-
-### Step 1: Install cmake
+Install CMake on Arch-based systems:
 
 ```bash
 sudo pacman -S cmake
 ```
 
-### Step 2: Build llama.cpp and Gizmo
+## Building
 
 ```bash
 cd gizmo-dev
 
-# Initialize llama.cpp submodule (if not already done)
-git submodule init
-git submodule update
+# Configure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-# Build with cmake
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j$(nproc)
+# Build (llama.cpp static libs + gizmo executable)
+cmake --build build -j$(nproc)
 ```
 
-### Step 3: Run with actual inference
+The resulting binary is at `build/gizmo`.
+
+## Installing
 
 ```bash
-# The model path for Ollama models
-MODEL_PATH="$HOME/.ollama/models/blobs/sha256-<digest>"
-
-# Run with layer sharding
-./build/gizmo run -m "$MODEL_PATH" -l 3
+cmake --install build --prefix ~/.local
+# Now gizmo is on PATH if ~/.local/bin is in your shell profile
 ```
 
-## Finding Your qwen3.8:27b Model Path
-
-Ollama stores models in `~/.ollama/models/`. To find the actual GGUF file:
+## Running
 
 ```bash
-# List ollama models
-ollama list
+# Show help
+./build/gizmo --help
 
-# Find the blob path (digest from the list output)
-ls -la ~/.ollama/models/blobs/
+# Run with a prompt
+./build/gizmo run -m /path/to/model.gguf -p "Hello!"
 
-# The model file will be something like:
-# sha256-22130167c4c20e20c71454612966ca8e8171e9b3cc8ab6ce8aa6cbfec79643
+# Low-memory sharded path on a qwen3 model
+./build/gizmo run -m /path/to/Qwen3-4B-Q4_K_M.gguf -p "Hello!" -r 1 -n 4 --measure-ram
 ```
 
-## Layer Sharding with llama.cpp
+## Finding Your Model Path
 
-llama.cpp uses `n_gpu_layers` to control how many layers to load. In Gizmo:
+`gizmo list` scans common directories for `.gguf` files:
+
+- `~/.local/share/gizmo/models`
+- `~/.lmstudio/models`
+- `~/.ollama/models/blobs`
+- `./models`
+
+You can also pass the full path directly with `-m /path/to/model.gguf`.
+
+## Layer Sharding
+
+With sharding enabled (the default), the GGUF is mmap'd but not prefaulted. Only the active block's weights are faulted into RAM; finished blocks can be evicted with `madvise(MADV_DONTNEED)`. Use `-r` to control the resident-layer sliding window and `-K` to chain blocks into row graphs.
 
 ```bash
-# Ultra-low-memory mode (3 layers at a time)
-./build/gizmo run -m model.gguf -l 3
+# Extreme low memory (qwen3 only)
+./build/gizmo run -m model.gguf -r 1 -p "Hello"
 
-# Extreme memory savings (1 layer at a time)
-./build/gizmo run -m model.gguf -l 1
+# Conservative window
+./build/gizmo run -m model.gguf -r 4 -p "Hello"
 
-# Balanced mode (16 layers)
-./build/gizmo run -m model.gguf -l 16
+# Default window
+./build/gizmo run -m model.gguf -r 8 -p "Hello"
+
+# Disable sharding entirely (full prefault)
+./build/gizmo run -m model.gguf --no-shard -p "Hello"
 ```
 
-## Expected Memory Usage (qwen3.8:27b)
+## Expected Memory Usage (qwen3 Qwen3-4B Q4_K_M)
 
-| Layers | RAM | Use Case |
-|--------|-----|----------|
-| 1 | ~522 MB | Absolute minimum |
-| 3 | ~1.5 GB | Ultra-low-memory default |
-| 8 | ~4.7 GB | Low memory systems |
-| 16 | ~8.2 GB | Balanced |
-| 34 | ~17.3 GB | Full model |
+| Resident Layers | RAM | Use Case |
+|-----------------|-----|----------|
+| 1 | ~510 MB | Absolute minimum |
+| 4 | ~700 MB | Ultra-low memory |
+| 8 | ~1.0 GB | Balanced |
+| all (`--no-shard`) | ~2.5 GB | Full model |
 
 ## Troubleshooting
 
 ### cmake not found
 Install with: `sudo pacman -S cmake`
 
-### llama.cpp submodule not found
-Run: `git submodule init && git submodule update`
+### llama.cpp build errors
+Make sure the `llama.cpp/` directory contains the upstream source tree. If it is empty or only partially populated, re-clone or re-initialize the submodule:
+
+```bash
+git submodule update --init --recursive
+```
 
 ### Model not found
-Make sure to use the full path to the GGUF file, not just the model name.
+Use the full path to the GGUF file, or place models in one of the scanned directories and run `gizmo list`.
+
+### Out of memory on large models
+If a model is too large for the sharded path or you want the full-model prefault baseline, pass `--no-shard` to use native `llama_decode`. For very large qwen3.5/qwen3.8 models such as Qwen3.8-27B on a 16 GB host, use `-r 1` so the per-block engine keeps only one layer resident at a time (~2.1 GB peak).

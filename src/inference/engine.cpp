@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
+#include <unistd.h>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -28,13 +29,16 @@ bool is_sharded_arch_supported(const llama_model* model) {
     }
     switch (model->arch) {
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN35:
+            // Per-block sharded engine is validated for Qwen3's pure-attention
+            // blocks and has been extended to Qwen3.5's hybrid layout (full
+            // attention + gated-delta-net SSM). Models using these arches run
+            // through the per-block engine when sharding is enabled.
             return true;
-        // Qwen3Next/VL and all MoE/hybrid variants are not yet validated
-        // with the per-block sharded engine. In particular, Qwen3.5's SSM
-        // path currently diverges from llama_decode on parity checks.
+        // Qwen3Next/VL and all MoE variants are not yet validated with the
+        // per-block sharded engine.
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VL:
-        case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
@@ -253,7 +257,8 @@ static int do_prefill(
     size_t *              out_sharded_rss = nullptr,
     size_t *              out_sharded_hwm = nullptr,
     bool                  prefill_unsharded = true,
-    bool                  verbose = false
+    bool                  verbose = false,
+    bool                  progress = false
 ) {
     if (sched != nullptr) {
         // Phase 7: allocate KV cache cells for the prefill batch
@@ -279,7 +284,7 @@ static int do_prefill(
         multi_block_result_t res = run_multi_block(
             model, sched, tokens, n_tokens, evict_weights,
             resident_layers, row_size, mctx,
-            /*pos_first=*/0, verbose);
+            /*pos_first=*/0, verbose, progress, "prefill");
         if (res.final_logits.empty()) {
             std::cerr << "Error: sharded prefill failed\n";
             if (mctx != nullptr) llama_memory_context_free(mctx);
@@ -370,7 +375,8 @@ static int do_decode_sharded(
     bool                  evict_weights,
     int32_t               resident_layers,
     int32_t               row_size,
-    bool                  verbose = false
+    bool                  verbose = false,
+    bool                  progress = false
 ) {
     if (sched == nullptr) {
         return -1;
@@ -394,7 +400,7 @@ static int do_decode_sharded(
     multi_block_result_t res = run_multi_block(
         model, sched, token_ids_arr, /*n_tokens=*/1,
         evict_weights, resident_layers, row_size, mctx,
-        /*pos_first=*/(int)pos, verbose);
+        /*pos_first=*/(int)pos, verbose, progress, "decode");
 
     if (res.final_logits.empty()) {
         std::cerr << "Error: sharded decode failed\n";
@@ -425,15 +431,17 @@ static int do_decode_sharded(
 }
 
 void InferenceEngine::reset_for_next_run() {
-    // Clear the un-sharded KV cache so the next generate() starts
-    // from an empty context. The sharded engine's per-block
-    // scratch is freed automatically by ggml_backend_sched_reset
-    // at the start of each block; we don't reset between runs
-    // because the scheduler is reused.
+    // Reset the memory context so the next generate()/prefill starts
+    // from a truly empty state. For pure-attention models this only
+    // clears KV cells; for hybrid recurrent models (qwen3.5) it also
+    // zeros the SSM state buffers. Passing data=true is required on
+    // recurrent models because leftover R/S state from a previous
+    // prompt leaks into the next one and breaks parity with a fresh
+    // llama_decode run.
     if (llama_context_ != nullptr) {
         llama_memory_t mem = llama_get_memory(llama_context_);
         if (mem != nullptr) {
-            llama_memory_clear(mem, /*data=*/false);
+            llama_memory_clear(mem, /*data=*/true);
         }
     }
 }
@@ -483,7 +491,7 @@ bool InferenceEngine::generate_stream(
                    sharded_evict_weights_, sharded_resident_layers_,
                    sharded_row_size_,
                    &sharded_rss, &sharded_hwm,
-                   /*prefill_unsharded=*/true, verbose_) != 0) {
+                   /*prefill_unsharded=*/true, verbose_, progress_) != 0) {
         llama_sampler_free(sampler);
         return false;
     }
@@ -498,6 +506,11 @@ bool InferenceEngine::generate_stream(
     int32_t n_past = n_tokens;  // KV cache already holds the prompt
 
     while (n_cur < n_predict) {
+        if (progress_ && !verbose_ && isatty(STDOUT_FILENO)) {
+            std::printf("\r[decode] token %2d/%d", n_cur + 1, n_predict);
+            std::fflush(stdout);
+        }
+
         llama_token new_token_id = llama_sampler_sample(sampler, llama_context_, -1);
 
         if (llama_vocab_is_eog(vocab, new_token_id)) {
@@ -521,7 +534,7 @@ bool InferenceEngine::generate_stream(
             if (do_decode_sharded(llama_context_, (const llama_model*)llama_model_,
                                   sharded_sched_, new_token_id, (llama_pos)n_past,
                                   sharded_evict_weights_, sharded_resident_layers_,
-                                  sharded_row_size_, verbose_) != 0) {
+                                  sharded_row_size_, verbose_, progress_) != 0) {
                 std::cerr << "Warning: sharded decode failed, falling back to llama_decode\n";
                 if (llama_decode(llama_context_, llama_batch_get_one(&new_token_id, 1)) != 0) {
                     std::cerr << "Error: un-sharded decode also failed\n";
@@ -552,6 +565,11 @@ bool InferenceEngine::generate_stream(
 
         ++n_past;
         n_cur++;
+    }
+
+    if (progress_ && !verbose_ && isatty(STDOUT_FILENO)) {
+        std::printf("\r%-40s\r", "");
+        std::fflush(stdout);
     }
 
     llama_sampler_free(sampler);
@@ -623,7 +641,7 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
                    sharded_row_size_,
                    &last_sharded_prefill_rss_,
                    &last_sharded_prefill_hwm_,
-                   /*prefill_unsharded=*/true, verbose_) != 0) {
+                   /*prefill_unsharded=*/true, verbose_, progress_) != 0) {
         return result;
     }
 
@@ -681,7 +699,7 @@ int InferenceEngine::prefill_only_tokens(const llama_token* tokens, int32_t n_to
                    sharded_row_size_,
                    &last_sharded_prefill_rss_,
                    &last_sharded_prefill_hwm_,
-                   /*prefill_unsharded=*/false, verbose_) != 0) {
+                   /*prefill_unsharded=*/false, verbose_, progress_) != 0) {
         return -1;
     }
     return 0;
@@ -720,7 +738,7 @@ int InferenceEngine::validate_prefill(
                        sharded_evict_weights_, sharded_resident_layers_,
                        sharded_row_size_,
                        nullptr, nullptr,
-                       /*prefill_unsharded=*/false, verbose_) != 0) {
+                       /*prefill_unsharded=*/false, verbose_, progress_) != 0) {
             return -1;
         }
         // do_prefill already copied sharded last-token logits into

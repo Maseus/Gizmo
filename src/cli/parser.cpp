@@ -113,6 +113,8 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
             }
         } else if (arg == "--verbose" || arg == "-v") {
             options.verbose = true;
+        } else if (arg == "--progress") {
+            options.progress = true;
         } else if (arg == "--json") {
             options.json_output = true;
         } else if (arg == "--argmax-only") {
@@ -222,6 +224,7 @@ Options:
                                 Single value for normal commands (default: 4);
                                 comma-separated list for sweep (default: 4)
   -v, --verbose                 Print sharded-engine diagnostic details
+      --progress                 Show an in-place progress indicator during prefill/decode
       --json                   Emit validation/sweep results as JSON
       --argmax-only            Validate only argmax parity, ignore logit diffs
       --max-diff <f>           Max abs logit diff tolerance (default: 1e-4)

@@ -1,15 +1,10 @@
 # qwen3.5 (qwen3.8) sharded engine design
 
-**Status:** Design doc for the next major phase of Gizmo. Phase 9 (row-graph
-amortization) closed on 2026-09-14 with K=1..8 working numerically but
-wall-time-neutral; the 1.17x un-sharded gap is intrinsic to per-block
-`mul_mat` compute, not scheduler overhead. The next challenge is the
-**qwen3.5 architecture** itself: hybrid (recurrent + full-attention),
-different norm layout, fused `wqkv`, MRoPE-4.
-
-This document scopes the work for the next session (Phase 10: scaffold)
-and the session after (Phase 11: full-attention port). Recurrent blocks
-are Phase 12 and are out of scope for this doc's actionable items.
+**Status:** Implemented and validated. Phases 10–12 are complete: the qwen3.5
+full-attention block, gated-delta-net recurrent block, and hybrid memory
+threading are all wired into the per-block sharded engine. `gizmo validate`
+passes with zero logit diffs on Qwen3.5-0.8B, 2B, 4B, 9B, and **Qwen3.8-27B**. This document
+is kept as historical design context for the port.
 
 ## 1. Target
 

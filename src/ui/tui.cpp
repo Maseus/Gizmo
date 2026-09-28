@@ -422,6 +422,133 @@ std::string ask_custom_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Inference profile picker
+// ---------------------------------------------------------------------------
+
+struct InferenceProfile {
+    std::string name;
+    std::string description;
+    bool no_shard = false;
+    int resident_layers = 8;
+    bool evict_weights = true;
+};
+
+std::vector<InferenceProfile> default_profiles() {
+    return {
+        { "Low memory",    "Sharded, keep 1 layer resident (~2 GB peak on 27B)", false, 1,  true },
+        { "Balanced",      "Sharded, keep 8 layers resident (default)",          false, 8,  true },
+        { "Fast",          "Load full model into RAM (no sharding)",             true,  8,  false },
+        { "Custom",        "Enter a resident-layer count",                       false, 1,  true },
+    };
+}
+
+int ask_custom_resident_layers() {
+    show_cursor();
+    clear_screen();
+    std::cout << "\x1b[1;36mCustom resident layers\x1b[0m\n\n";
+    std::cout << "How many transformer blocks should stay resident in RAM?\n";
+    std::cout << "Use 1 for the lowest memory footprint, or a large number to disable eviction.\n";
+    std::cout << "> ";
+    std::cout.flush();
+    std::string line;
+    if (!std::getline(std::cin, line)) return 1;
+    long v = std::strtol(line.c_str(), nullptr, 10);
+    if (v < 1) v = 1;
+    return static_cast<int>(v);
+}
+
+std::string profile_display_line(const InferenceProfile& p) {
+    return p.name + "  -  " + p.description;
+}
+
+InferenceProfile pick_profile_noninteractive(const std::vector<InferenceProfile>& profiles) {
+    std::cout << "Inference profiles:\n";
+    for (size_t i = 0; i < profiles.size(); ++i) {
+        std::cout << "  " << (i + 1) << ". " << profile_display_line(profiles[i]) << "\n";
+    }
+    std::cout << "Enter number (q to quit): ";
+    std::cout.flush();
+    std::string line;
+    if (!std::getline(std::cin, line)) return {};
+    if (line == "q" || line == "Q") return {};
+    char* end = nullptr;
+    long n = std::strtol(line.c_str(), &end, 10);
+    if (end == line.c_str() || n < 1 || static_cast<size_t>(n) > profiles.size()) return {};
+    return profiles[static_cast<size_t>(n) - 1];
+}
+
+InferenceProfile pick_profile_interactive(const std::vector<InferenceProfile>& profiles) {
+    const bool is_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    if (!is_tty) {
+        return pick_profile_noninteractive(profiles);
+    }
+
+    RawMode raw;
+    if (!raw.enable()) {
+        return pick_profile_noninteractive(profiles);
+    }
+    CursorGuard cursor;
+    cursor.hide();
+
+    size_t selected = 0;
+    auto draw = [&]() {
+        clear_screen();
+        std::cout << "\x1b[1;36mGizmo Server\x1b[0m - pick an inference profile\n\n";
+        std::cout << "Use \xe2\x86\x91/\xe2\x86\x93 or type a number, Enter to confirm, q to quit.\n\n";
+        for (size_t i = 0; i < profiles.size(); ++i) {
+            const auto& p = profiles[i];
+            bool active = (i == selected);
+            if (active) std::cout << "\x1b[7m";
+            std::cout << "  " << (i + 1) << ". " << profile_display_line(p);
+            if (active) std::cout << "\x1b[0m";
+            std::cout << "\n";
+        }
+        std::cout.flush();
+    };
+
+    std::string number_buffer;
+    bool dirty = true;
+    while (true) {
+        if (dirty) {
+            draw();
+            dirty = false;
+        }
+        char c = 0;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (c == 'q' || c == 'Q') {
+            return {};
+        }
+        if (c == '\n' || c == '\r') {
+            return profiles[selected];
+        }
+        if (c == '\x1b') {
+            char seq[3] = {0};
+            if (read(STDIN_FILENO, &seq[0], 1) <= 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) <= 0) continue;
+            if (seq[0] == '[') {
+                if (seq[1] == 'A' && selected > 0) { --selected; dirty = true; }
+                else if (seq[1] == 'B' && selected + 1 < profiles.size()) { ++selected; dirty = true; }
+            }
+            continue;
+        }
+        if (c >= '0' && c <= '9') {
+            number_buffer.push_back(c);
+            long idx = std::strtol(number_buffer.c_str(), nullptr, 10);
+            if (idx >= 1 && static_cast<size_t>(idx) <= profiles.size()) {
+                selected = static_cast<size_t>(idx) - 1;
+                dirty = true;
+            }
+        } else {
+            number_buffer.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IP discovery
 // ---------------------------------------------------------------------------
 
@@ -458,29 +585,36 @@ public:
 
     int run() {
         auto models = discover_models();
+        std::string path;
         if (models.empty()) {
             // No discovered models: go straight to custom path.
-            std::string path = ask_custom_path();
-            if (path.empty() || !file_exists(path)) {
-                std::cerr << "No model selected.\n";
-                return 1;
-            }
-            return serve(path);
-        }
-
-        std::string path = pick_model_interactive(models);
-        if (path.empty()) {
-            // The user selected the custom-path option.
-            size_t custom_idx = models.size() - 1; // appended last
-            if (custom_idx < models.size() && models[custom_idx].source == "custom") {
-                path = ask_custom_path();
+            path = ask_custom_path();
+        } else {
+            path = pick_model_interactive(models);
+            if (path.empty()) {
+                // The user selected the custom-path option.
+                size_t custom_idx = models.size() - 1; // appended last
+                if (custom_idx < models.size() && models[custom_idx].source == "custom") {
+                    path = ask_custom_path();
+                }
             }
         }
         if (path.empty() || !file_exists(path)) {
             std::cerr << "No model selected.\n";
             return 1;
         }
-        return serve(path);
+
+        auto profiles = default_profiles();
+        InferenceProfile profile = pick_profile_interactive(profiles);
+        if (profile.name.empty()) {
+            std::cerr << "No inference profile selected.\n";
+            return 1;
+        }
+        if (profile.name == "Custom") {
+            profile.resident_layers = ask_custom_resident_layers();
+        }
+
+        return serve(path, profile);
     }
 
 private:
@@ -488,22 +622,33 @@ private:
     int port_;
     bool cors_;
 
-    int serve(const std::string& model_path) {
-        // Load the model. For a stable API server we default to un-sharded
-        // (full-model) inference so requests don't hit the experimental sharded
-        // scheduler crashes.
+    int serve(const std::string& model_path, const InferenceProfile& profile) {
         InferenceEngine engine;
         engine.set_threads(4);
 
         clear_screen();
         std::cout << "\x1b[1;36mGizmo Server\x1b[0m\n";
         std::cout << "Loading model: " << model_path << "\n";
-        std::cout << "Layers: " << "..." << "\n";
+        std::cout << "Profile: " << profile.name;
+        if (!profile.no_shard) {
+            std::cout << " (resident " << profile.resident_layers << " blocks)";
+        }
+        std::cout << "\n";
         std::cout.flush();
 
-        if (!engine.initialize(model_path, /*layer_shard_lazy=*/false)) {
+        if (!engine.initialize(model_path, /*layer_shard_lazy=*/!profile.no_shard)) {
             std::cerr << "\nFailed to initialize inference engine for: " << model_path << "\n";
             return 1;
+        }
+
+        if (!profile.no_shard) {
+            engine.enable_sharded_engine(
+                profile.resident_layers,
+                profile.evict_weights,
+                /*row_size=*/1);
+            if (!engine.is_sharded()) {
+                std::cout << "Note: sharded engine was not enabled; falling back to llama_decode.\n";
+            }
         }
 
         ServerConfig config;
@@ -532,7 +677,12 @@ private:
             clear_screen();
             std::cout << "\x1b[1;36mGizmo Server\x1b[0m is running\n";
             std::cout << "Model:  " << engine.get_model_info() << "\n";
-            std::cout << "Layers: " << engine.n_layer() << "  |  Sharding: disabled (API stable)\n";
+            std::cout << "Layers: " << engine.n_layer();
+            if (engine.is_sharded()) {
+                std::cout << "  |  Sharding: enabled  |  Resident: " << profile.resident_layers << "\n";
+            } else {
+                std::cout << "  |  Sharding: disabled (full model)\n";
+            }
             std::cout << "Listen: " << host_ << ":" << port_ << "\n";
 
             std::vector<std::string> ips = local_ipv4_addresses();

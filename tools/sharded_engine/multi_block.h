@@ -53,5 +53,7 @@ multi_block_result_t run_multi_block(
     int                             row_size,
     llama_memory_context_i *        mctx,
     int                             pos_first = 0,
-    bool                            verbose = false
+    bool                            verbose = false,
+    bool                            progress = false,
+    const char *                    stage = "prefill"
 );
