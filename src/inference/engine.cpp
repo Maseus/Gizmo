@@ -449,7 +449,8 @@ void InferenceEngine::reset_for_next_run() {
 bool InferenceEngine::generate_stream(
     const std::string& prompt,
     const InferenceConfig& config,
-    std::function<void(const std::string& token_text, int32_t token_id)> callback
+    std::function<void(const std::string& token_text, int32_t token_id)> callback,
+    std::function<bool()> should_cancel
 ) {
     if (!initialized_ || llama_context_ == nullptr) {
         return false;
@@ -479,7 +480,7 @@ bool InferenceEngine::generate_stream(
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(config.top_k));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(config.top_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(config.temperature));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(42));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(config.seed >= 0 ? config.seed : 42));
 
     // Prefill. Sharded path runs the per-block engine, which writes
     // K/V directly into the KV cache. Non-sharded path runs the
@@ -504,8 +505,16 @@ bool InferenceEngine::generate_stream(
     int32_t n_predict = config.max_tokens;
     int32_t n_cur = 0;
     int32_t n_past = n_tokens;  // KV cache already holds the prompt
+    std::string generated_text;
 
     while (n_cur < n_predict) {
+        if (should_cancel && should_cancel()) {
+            if (verbose_) {
+                std::cout << "Generation cancelled by caller\n";
+            }
+            break;
+        }
+
         if (progress_ && !verbose_ && isatty(STDOUT_FILENO)) {
             std::printf("\r[decode] token %2d/%d", n_cur + 1, n_predict);
             std::fflush(stdout);
@@ -525,8 +534,25 @@ bool InferenceEngine::generate_stream(
         if (piece_len > 0) {
             piece[piece_len] = '\0';
             std::string token_text(piece);
+            generated_text += token_text;
             if (callback) {
                 callback(token_text, new_token_id);
+            }
+            // Check stop sequences against the accumulated output.
+            bool should_stop = false;
+            for (const auto& s : config.stop) {
+                if (s.empty()) continue;
+                if (generated_text.size() >= s.size() &&
+                    generated_text.compare(generated_text.size() - s.size(), s.size(), s) == 0) {
+                    should_stop = true;
+                    break;
+                }
+            }
+            if (should_stop) {
+                if (verbose_) {
+                    std::cout << "Stop sequence matched\n";
+                }
+                break;
             }
         }
 
@@ -785,6 +811,20 @@ std::string InferenceEngine::get_model_info() const {
     info += ", Embd: " + std::to_string(llama_model_n_embd(llama_model_));
     info += ", Vocab: " + std::to_string(llama_vocab_n_tokens(vocab));
     return info;
+}
+
+std::string InferenceEngine::get_model_id() const {
+    if (model_path_.empty()) {
+        return "gizmo-model";
+    }
+    // Return the basename without the .gguf extension.
+    size_t slash = model_path_.find_last_of("/\\");
+    std::string name = (slash == std::string::npos) ? model_path_ : model_path_.substr(slash + 1);
+    size_t dot = name.find_last_of('.');
+    if (dot != std::string::npos) {
+        name = name.substr(0, dot);
+    }
+    return name;
 }
 
 int32_t InferenceEngine::n_layer() const {

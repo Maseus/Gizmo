@@ -304,6 +304,7 @@ std::vector<std::string> local_ipv4_addresses() {
 struct ServeSettingsState {
     std::string host = "0.0.0.0";
     int port = 8080;
+    int request_timeout_seconds = 300;
     bool cors = false;
     bool no_evict = false;
     bool verbose = false;
@@ -314,6 +315,7 @@ struct ServeSettingsState {
 enum class SettingsField : int {
     Host,
     Port,
+    RequestTimeout,
     Cors,
     NoEvict,
     Verbose,
@@ -341,25 +343,27 @@ ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
 
     auto field_label = [](SettingsField f) -> std::string {
         switch (f) {
-            case SettingsField::Host:    return "Host";
-            case SettingsField::Port:    return "Port";
-            case SettingsField::Cors:    return "CORS";
-            case SettingsField::NoEvict: return "Keep weights resident (no eviction)";
-            case SettingsField::Verbose: return "Verbose sharded-engine output";
-            case SettingsField::Threads: return "Threads";
-            case SettingsField::Start:   return "[ Start server ]";
+            case SettingsField::Host:           return "Host";
+            case SettingsField::Port:           return "Port";
+            case SettingsField::RequestTimeout: return "Request timeout (seconds)";
+            case SettingsField::Cors:           return "CORS";
+            case SettingsField::NoEvict:        return "Keep weights resident (no eviction)";
+            case SettingsField::Verbose:        return "Verbose sharded-engine output";
+            case SettingsField::Threads:        return "Threads";
+            case SettingsField::Start:          return "[ Start server ]";
             default: return "";
         }
     };
 
     auto field_value = [&](SettingsField f) -> std::string {
         switch (f) {
-            case SettingsField::Host:    return st.host;
-            case SettingsField::Port:    return std::to_string(st.port);
-            case SettingsField::Cors:    return st.cors ? "on" : "off";
-            case SettingsField::NoEvict: return st.no_evict ? "on" : "off";
-            case SettingsField::Verbose: return st.verbose ? "on" : "off";
-            case SettingsField::Threads: return std::to_string(st.threads);
+            case SettingsField::Host:           return st.host;
+            case SettingsField::Port:           return std::to_string(st.port);
+            case SettingsField::RequestTimeout: return std::to_string(st.request_timeout_seconds);
+            case SettingsField::Cors:           return st.cors ? "on" : "off";
+            case SettingsField::NoEvict:        return st.no_evict ? "on" : "off";
+            case SettingsField::Verbose:        return st.verbose ? "on" : "off";
+            case SettingsField::Threads:        return std::to_string(st.threads);
             default: return "";
         }
     };
@@ -401,6 +405,10 @@ ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
             char* end = nullptr;
             long v = std::strtol(edit_buffer.c_str(), &end, 10);
             if (end != edit_buffer.c_str() && v > 0 && v < 65536) st.port = static_cast<int>(v);
+        } else if (f == SettingsField::RequestTimeout) {
+            char* end = nullptr;
+            long v = std::strtol(edit_buffer.c_str(), &end, 10);
+            if (end != edit_buffer.c_str() && v > 0 && v <= 86400) st.request_timeout_seconds = static_cast<int>(v);
         } else if (f == SettingsField::Threads) {
             char* end = nullptr;
             long v = std::strtol(edit_buffer.c_str(), &end, 10);
@@ -518,6 +526,7 @@ public:
         ServeSettingsState st;
         st.host = settings_.host;
         st.port = settings_.port;
+        st.request_timeout_seconds = settings_.request_timeout_seconds;
         st.cors = settings_.cors;
         st.no_evict = settings_.no_evict;
         st.verbose = settings_.verbose;
@@ -572,8 +581,12 @@ private:
         config.port = st.port;
         config.threads = st.threads;
         config.cors = st.cors;
+        config.request_timeout_seconds = st.request_timeout_seconds;
+        config.log_file = settings_.log_file;
+        config.json_logs = settings_.json_logs;
 
         HttpServer server(engine, config);
+        server.install_signal_handlers(&server);
         server.start();
 
         // Small delay to let the listener start before we read is_running().
@@ -663,6 +676,79 @@ private:
 int run_server_tui(const ServeSettings& settings) {
     ServerTui tui(settings);
     return tui.run();
+}
+
+// ---------------------------------------------------------------------------
+// Headless server startup
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int serve_headless(const ServeSettings& settings) {
+    const std::string& model_path = settings.model_path;
+    if (model_path.empty() || !file_exists(model_path)) {
+        std::cerr << "Error: model not found: " << model_path << "\n";
+        return 1;
+    }
+
+    InferenceEngine engine;
+    engine.set_verbose(settings.verbose);
+    engine.set_threads(settings.threads);
+
+    std::cout << "Loading model: " << model_path << "\n";
+    if (!engine.initialize(model_path, /*layer_shard_lazy=*/!settings.no_shard)) {
+        std::cerr << "Failed to initialize inference engine for: " << model_path << "\n";
+        return 1;
+    }
+
+    if (!settings.no_shard) {
+        const int32_t resident = settings.resident_layers > 0 ? settings.resident_layers : 8;
+        const int32_t row = settings.row_size > 0 ? settings.row_size : 1;
+        engine.enable_sharded_engine(resident, /*evict_weights=*/!settings.no_evict, row);
+        if (!engine.is_sharded()) {
+            std::cout << "Note: sharded engine was not enabled; falling back to llama_decode.\n";
+        }
+    }
+
+    ServerConfig config;
+    config.host = settings.host;
+    config.port = settings.port;
+    config.threads = settings.threads;
+    config.cors = settings.cors;
+    config.request_timeout_seconds = settings.request_timeout_seconds;
+    config.log_file = settings.log_file;
+    config.json_logs = settings.json_logs;
+
+    HttpServer server(engine, config);
+    server.install_signal_handlers(&server);
+    server.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!server.is_running()) {
+        std::cerr << "Failed to start HTTP server on " << settings.host << ":" << settings.port << "\n";
+        return 1;
+    }
+
+    std::cout << "Gizmo server listening on http://" << settings.host << ":" << settings.port << "\n";
+    std::cout << "Model id: " << engine.get_model_id() << "\n";
+    if (settings.cors) {
+        std::cout << "CORS enabled for browser frontends.\n";
+    }
+    std::cout << "Press Ctrl+C to stop.\n";
+
+    while (server.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    server.stop();
+    std::cout << "Server stopped.\n";
+    return 0;
+}
+
+} // namespace
+
+int run_server_headless(const ServeSettings& settings) {
+    return serve_headless(settings);
 }
 
 } // namespace gizmo

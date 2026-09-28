@@ -7,7 +7,10 @@ A C++ command-line wrapper around llama.cpp for running quantized LLMs locally, 
 ## Quick Start
 
 ```bash
-# Build (uses CMake; build/ contains the static binary)
+# Install the latest release binary (requires ~/.local/bin on PATH)
+curl -fsSL https://raw.githubusercontent.com/maseus/gizmo/master/install.sh | bash
+
+# Or build from source (uses CMake; produces a static binary)
 cmake -S . -B build -DCMAKE_BUILD_TYPE Release
 cmake --build build -j$(nproc)
 
@@ -24,10 +27,13 @@ gizmo run -m /path/to/model.gguf -p "Hello" --progress -n 4
 gizmo chat                     # interactive chat with model picker
 gizmo chat -m /path/to/model.gguf -n 64
 
-# Start the OpenAI-compatible HTTP server (interactive model + feature picker)
-gizmo serve
-# Or pass a model directly; use --cors for browser frontends (OpenWebUI, Hermes)
+# Start the OpenAI-compatible HTTP server directly (requires -m)
 gizmo serve -m /path/to/model.gguf --cors --port 8080
+# Use --json-logs and --log-file for structured request logs
+gizmo serve -m /path/to/model.gguf --cors --json-logs --log-file /var/log/gizmo.log
+
+# Launch the interactive server dashboard instead
+gizmo tui
 
 # Add custom model directories (also set GIZMO_MODEL_PATH=~/models:/data/ggufs)
 gizmo chat --model-path ~/models:/data/ggufs
@@ -40,12 +46,13 @@ gizmo chat --model-path ~/models:/data/ggufs
 - Builds the llama.cpp dependency as a static library so the `gizmo` binary is self-contained.
 - Implements a **per-block sharded inference engine** for **qwen3-family** and **qwen3.5-family** models. This engine builds a separate `ggml_cgraph` per transformer block, threads the residual/KV/recurrent state, and can evict each block's weights after use. Output matches the native `llama_decode` baseline exactly for both prefill and decode on supported architectures.
 - Automatically falls back to native `llama_decode` for unsupported architectures (e.g., qwen2/qwen2.5, qwen3next/qwen3vl, and all MoE variants), so those models still work correctly with `--no-shard`-equivalent behavior.
-- Uses the model's built-in chat template in `gizmo chat` via `llama_chat_apply_template` when available.
+- Uses the model's built-in chat template in `gizmo chat` and in the `/v1/chat/completions` endpoint via `llama_chat_apply_template` when available.
+- Runs an **OpenAI-compatible HTTP server** with graceful shutdown (SIGINT/SIGTERM), per-request timeouts, a bounded generation queue (safe for single-user + Claude Code subagents), structured JSON request logs, and CORS for browser frontends.
+- Serves on all interfaces by default and prints LAN IP addresses in the interactive `tui` dashboard.
 
 ## What Gizmo does **not** do (yet)
 
 - Built-in model downloader (current `download` delegates to the system `curl`/`wget` binary).
-- Chat-template-aware formatting in the HTTP server's `/v1/chat/completions` endpoint (it uses a plain-text join of messages).
 
 ## Commands
 
@@ -62,7 +69,7 @@ gizmo chat --model-path ~/models:/data/ggufs
 | `serve`     | Start HTTP server (OpenAI-compatible API); requires `-m`. `server` is an alias |
 | `tui`       | Launch interactive server TUI (model picker + live dashboard) |
 
-When no command is given, `gizmo` prints this help. Use `gizmo chat` for the interactive chat TUI and `gizmo serve -m <model>` for the OpenAI-compatible HTTP server.
+When no command is given, `gizmo` prints this help. Use `gizmo chat` for the interactive chat TUI, `gizmo serve -m <model>` for the non-interactive OpenAI-compatible HTTP server, and `gizmo tui` for the interactive server dashboard.
 
 ## Options
 
@@ -85,6 +92,13 @@ When no command is given, `gizmo` prints this help. Use `gizmo chat` for the int
 - `--mean-diff <f>` — mean abs logit diff tolerance (default: 1e-5, for `validate`)
 - `--sweep-max-tokens N` — `sweep`: decode tokens per configuration (default 16)
 - `--sweep-prefill-tokens N` — `sweep`: prefill tokens per configuration (default 64)
+- `--host <addr>` — server bind address (default: `0.0.0.0`)
+- `--port <N>` — server port (default: 8080)
+- `--server-threads <N>` — HTTP worker threads (default: 4)
+- `--cors` — enable CORS headers (required for browser frontends such as OpenWebUI and Hermes Desktop)
+- `--request-timeout <N>` — per-request generation timeout in seconds (default: 300)
+- `--log-file <path>` — append structured JSON request logs to a file
+- `--json-logs` — also emit structured JSON request logs to stderr
 - `-h, --help` — help
 - `--model-path <path[:path]>` — extra directories to scan for GGUF models. Also read from `GIZMO_MODEL_PATH` environment variable
 
@@ -193,7 +207,7 @@ The sharded engine is implemented and validated for **qwen3-family full-attentio
 
 ## HTTP Server
 
-`gizmo serve` (alias `gizmo server`) starts an OpenAI-compatible HTTP server on `--host` / `--port` (default `0.0.0.0:8080`).
+`gizmo serve -m model.gguf` (alias `gizmo server -m model.gguf`) starts a non-interactive OpenAI-compatible HTTP server on `--host` / `--port` (default `0.0.0.0:8080`). `gizmo tui` opens the interactive server dashboard instead.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -205,6 +219,46 @@ The sharded engine is implemented and validated for **qwen3-family full-attentio
 | `POST` | `/v1/chat/completions` | Chat completion (streaming SSE supported) |
 
 Enable CORS with `--cors`.
+
+### Production serving
+
+- **Single-user, LAN-safe**: binds to `0.0.0.0` by default, so it is discoverable on your local network. There is no authentication or HTTPS yet; only run it on networks you trust.
+- **Graceful shutdown**: `SIGINT`/`SIGTERM` stop new requests and let the current generation finish.
+- **Request timeout**: each generation is capped by `--request-timeout` (default 300 s). Slow/hung requests are cancelled cleanly.
+- **Concurrency**: the engine runs one generation at a time; extra requests queue up to `max_queue_depth` (8) and are rejected with HTTP 503 once the queue is full. This is safe for Claude Code subagents that may issue parallel requests.
+- **Structured logs**: use `--json-logs` for one JSON line per request on stderr, and `--log-file` to append to a file for dashboards or log shippers.
+- **Client compatibility**: tested with **OpenWebUI**, **Hermes Desktop**, and **Claude Code**. Point them at `http://<host>:<port>/v1/chat/completions`.
+
+```bash
+# Serve a model with CORS and 60-second request timeout
+gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080 --cors --request-timeout 60
+
+# Emit JSON request logs to stderr and a file
+gizmo serve -m /path/to/model.gguf --json-logs --log-file /var/log/gizmo.log
+
+# Test the endpoints
+curl http://127.0.0.1:8080/v1/health
+curl http://127.0.0.1:8080/v1/models
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}'
+```
+
+### Docker
+
+A multi-stage `Dockerfile` is included. Build it and run a model mounted from the host:
+
+```bash
+docker build -t gizmo .
+docker run -p 8080:8080 -v /path/to/models:/models:ro gizmo \
+  serve -m /models/model.gguf --cors --host 0.0.0.0
+```
+
+## Packaging and releases
+
+- **Install script**: `install.sh` downloads the latest GitHub Release binary for Linux/macOS and places it in `~/.local/bin` (or `$INSTALL_DIR`).
+- **GitHub Actions**: `.github/workflows/build.yml` builds on `ubuntu-latest` and `macos-latest` and uploads release artifacts for every `v*` tag.
+- **CPack**: `cmake --build build --target package` produces `.tar.gz` archives and, on Debian/Ubuntu, `.deb` packages.
 
 ## Project Structure
 

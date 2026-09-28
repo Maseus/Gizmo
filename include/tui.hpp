@@ -14,9 +14,15 @@ struct ServeSettings {
     int32_t port = 8080;
     int32_t threads = 4;
     int32_t max_tokens = 128;
+    int32_t request_timeout_seconds = 300;
+    std::string log_file;
+    bool json_logs = false;
     bool cors = false;
     bool no_evict = false;
     bool verbose = false;
+    bool no_shard = false;
+    int32_t resident_layers = 8;
+    int32_t row_size = 1;
 };
 
 // Launch the interactive Gizmo server TUI.
@@ -26,6 +32,11 @@ struct ServeSettings {
 //
 // Returns 0 on clean exit, non-zero on error.
 int run_server_tui(const ServeSettings& settings);
+
+// Start the HTTP server without the interactive TUI.
+// Uses the supplied model and settings directly; blocks until the server is
+// stopped via signal (SIGINT/SIGTERM) or an error occurs.
+int run_server_headless(const ServeSettings& settings);
 
 // Backwards-compatible overload.
 inline int run_server_tui(const std::string& host, int port, bool cors) {

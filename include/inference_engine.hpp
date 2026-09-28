@@ -19,6 +19,8 @@ struct InferenceConfig {
     float top_p = 0.95f;
     int32_t top_k = 40;
     float repeat_penalty = 1.1f;
+    int32_t seed = -1;  // -1 = random seed from llama_sampler_init_dist
+    std::vector<std::string> stop;  // optional stop strings/sequences
 };
 
 struct TokenResult {
@@ -86,10 +88,13 @@ public:
     // token. The callback receives the detokenized text piece and the raw
     // token id. Used by the HTTP server for streaming (SSE) responses.
     // Returns false if generation failed before the first token.
+    // If `should_cancel` returns true the decode loop is aborted early; this
+    // is used by the HTTP server to enforce per-request timeouts.
     bool generate_stream(
         const std::string& prompt,
         const InferenceConfig& config,
-        std::function<void(const std::string& token_text, int32_t token_id)> callback
+        std::function<void(const std::string& token_text, int32_t token_id)> callback,
+        std::function<bool()> should_cancel = nullptr
     );
 
     // Generate a single token
@@ -132,6 +137,9 @@ public:
 
     // Get model info
     std::string get_model_info() const;
+
+    // Concise model identifier suitable for OpenAI-compatible responses.
+    std::string get_model_id() const;
 
     // Raw accessors for the sharded wrapper / external introspection.
     llama_model*   raw_model()   const { return llama_model_;   }

@@ -72,11 +72,25 @@
 - [x] `--progress` in-place progress indicator for sharded prefill/decode (TTY only, silenced by `--verbose` or non-TTY stdout)
 - [x] Default no-command chat TUI with model picker and live speed/RSS/HWM footer
 - [x] `gizmo serve` interactive launcher with model picker, profile picker, and feature toggles
+- [x] Headless `gizmo serve -m` for production and Docker use
 - [x] `--model-path` / `GIZMO_MODEL_PATH` custom model search directories
 - [ ] Automatic sweet-spot recommendation from `gizmo sweep` results
 - [ ] Built-in model download via libcurl (current `download` delegates to system `curl`/`wget`)
-- [ ] Chat-template-aware formatting in the HTTP server's `/v1/chat/completions`
 - [ ] Better token-usage reporting in streaming SSE responses
+
+### Production Readiness
+- [x] Graceful shutdown via SIGINT/SIGTERM
+- [x] Per-request generation timeout with cancellation support
+- [x] Bounded generation queue for safe single-user + parallel subagent use
+- [x] OpenAI-compatible `/v1/` endpoints (`/v1/models`, `/v1/completions`, `/v1/chat/completions`, `/v1/health`)
+- [x] Chat-template-aware formatting in `/v1/chat/completions` via `llama_chat_apply_template`
+- [x] CORS preflight support for browser frontends
+- [x] Structured JSON request logging to stderr and/or a file
+- [x] Concise `model` id in OpenAI responses (basename without `.gguf`)
+- [x] Multi-stage `Dockerfile`
+- [x] GitHub Actions CI/release workflow
+- [x] `install.sh` release installer
+- [x] CPack packaging (TGZ + Debian)
 
 ### Polish
 - [ ] Reduce sharded-engine diagnostic noise further when `--verbose` is off
@@ -97,8 +111,9 @@
 ## Next Steps
 
 1. Validate remaining local model families (`qwen3`, `qwen2`, `qwen2.5`, MoE) with the refreshed CLI matrix.
-2. Implement convenience features (sweet-spot sweep, libcurl download, server chat template).
+2. Implement convenience features (sweet-spot sweep, libcurl download, better SSE usage reporting).
 3. Performance tuning: find the best default resident-layer count per model family.
+4. Add HTTPS / basic-auth support when leaving the local-only scenario.
 
 ## Current Build Command
 

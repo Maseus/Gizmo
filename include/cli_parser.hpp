@@ -51,6 +51,9 @@ struct CliOptions {
     int32_t port = 8080;
     int32_t server_threads = 4;
     bool cors = false;            // enable CORS headers
+    int32_t request_timeout_seconds = 300; // 5 minutes
+    std::string log_file;         // append-mode structured JSON log path
+    bool json_logs = false;       // emit JSON logs to stderr
 
     // Download options
     std::string download_url;     // URL to download from

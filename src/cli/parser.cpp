@@ -132,6 +132,12 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
             if (i + 1 < argc) options.server_threads = std::atoi(argv[++i]);
         } else if (arg == "--cors") {
             options.cors = true;
+        } else if (arg == "--request-timeout") {
+            if (i + 1 < argc) options.request_timeout_seconds = std::atoi(argv[++i]);
+        } else if (arg == "--log-file") {
+            if (i + 1 < argc) options.log_file = argv[++i];
+        } else if (arg == "--json-logs") {
+            options.json_logs = true;
         } else if (arg == "--url") {
             if (i + 1 < argc) options.download_url = argv[++i];
         } else if (arg == "--model-path") {
@@ -240,7 +246,10 @@ Options:
       --host <addr>             Server bind address (default: 0.0.0.0)
       --port <N>                Server port (default: 8080)
       --server-threads <N>      Server worker threads (default: 4)
-      --cors                    Enable CORS headers
+      --cors                    Enable CORS headers (required for browser frontends)
+      --request-timeout <N>     Per-request generation timeout in seconds (default: 300)
+      --log-file <path>         Append structured JSON request logs to a file
+      --json-logs               Also emit structured JSON request logs to stderr
       --url <url>               Download URL (for download command)
       --model-path <path[:path]>  Extra directories to scan for GGUF models
                                     (also read from GIZMO_MODEL_PATH env var)

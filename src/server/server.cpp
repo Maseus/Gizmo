@@ -7,18 +7,21 @@
 #include "httplib.h"
 #include "json.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <algorithm>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -36,6 +39,7 @@ public:
     void push(const std::string& chunk) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (closed_) return;
             chunks_.push_back(chunk);
         }
         cv_.notify_one();
@@ -62,8 +66,13 @@ public:
         cv_.notify_all();
     }
 
+    bool is_closed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<std::string> chunks_;
     bool closed_ = false;
@@ -92,16 +101,73 @@ int count_tokens(const llama_model* model, const std::string& text) {
     return n < 0 ? 0 : n;
 }
 
+// Generate a short random request id.
+std::string make_request_id() {
+    static std::mt19937_64 rng(std::random_device{}());
+    std::ostringstream oss;
+    oss << "req_" << std::hex << (rng() & 0xffffffffffff);
+    return oss.str();
+}
+
+// ISO-8601-ish timestamp for structured logs.
+std::string format_log_time_iso() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    return oss.str();
+}
+
+// Human-readable time for the TUI dashboard.
+std::string format_log_time() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%H:%M:%S");
+    return oss.str();
+}
+
+// Extract the request_id header if present.
+std::string request_id_from_header(const httplib::Request& req) {
+    auto it = req.headers.find("X-Request-ID");
+    if (it != req.headers.end() && !it->second.empty()) {
+        return it->second;
+    }
+    return make_request_id();
+}
+
 } // namespace
 
 HttpServer::HttpServer(InferenceEngine& engine, const ServerConfig& config)
     : engine_(engine)
     , config_(config)
-    , running_(false) {
+    , running_(false)
+    , ready_(false)
+    , stop_requested_(false)
+    , start_time_(std::chrono::steady_clock::now()) {
+    if (!config_.log_file.empty()) {
+        log_stream_.open(config_.log_file, std::ios::out | std::ios::app);
+    }
 }
 
 HttpServer::~HttpServer() {
     stop();
+}
+
+void HttpServer::install_signal_handlers(HttpServer* instance) {
+    static HttpServer* target = nullptr;
+    target = instance;
+    auto handler = [](int /*sig*/) {
+        if (target != nullptr) {
+            target->stop();
+        }
+    };
+    std::signal(SIGINT, handler);
+    std::signal(SIGTERM, handler);
 }
 
 void HttpServer::start() {
@@ -116,37 +182,55 @@ void HttpServer::start() {
     // Set up routes
     using httplib::Request;
     using httplib::Response;
+
+    // Root redirects to the OpenAI-compatible model list.
+    svr_->Get("/", [this](const Request& /*req*/, Response& res) {
+        set_cors_headers(res);
+        res.status = 302;
+        res.set_header("Location", "/v1/models");
+    });
+
     svr_->Get("/health", [this](const Request& req, Response& res) { handle_health(req, res); });
     svr_->Get("/v1/health", [this](const Request& req, Response& res) { handle_health(req, res); });
     svr_->Get("/v1/", [this](const Request& req, Response& res) { handle_models(req, res); });
+    svr_->Get("/v1", [this](const Request& req, Response& res) { handle_models(req, res); });
     svr_->Get("/v1/models", [this](const Request& req, Response& res) { handle_models(req, res); });
     svr_->Post("/v1/completions", [this](const Request& req, Response& res) { handle_completions(req, res); });
     svr_->Post("/v1/chat/completions", [this](const Request& req, Response& res) { handle_chat_completions(req, res); });
 
-    // Preflight for CORS
+    // Preflight for CORS (always registered when CORS is on; some clients probe
+    // OPTIONS before POST).
     if (config_.cors) {
-        svr_->Options(".*", [this](const Request& /*req*/, Response& res) {
-            set_cors_headers(res);
-            res.status = 204;
-        });
+        svr_->Options(".*", [this](const Request& req, Response& res) { handle_options(req, res); });
     }
 
     std::cout << "Starting Gizmo HTTP server on " << config_.host << ":" << config_.port << "\n";
     std::cout << "  Threads: " << config_.threads << "\n";
     std::cout << "  CORS: " << (config_.cors ? "enabled" : "disabled") << "\n";
+    std::cout << "  Request timeout: " << config_.request_timeout_seconds << "s\n";
     std::cout << "  Model: " << engine_.get_model_info() << "\n";
     std::cout << "  Sharding: " << (engine_.is_sharded() ? "enabled" : "disabled") << "\n";
 
     running_.store(true);
+    ready_.store(false);
 
     // Run server in a member thread so the httplib::Server object stays alive.
     server_thread_ = std::thread([this]() {
-        svr_->listen(config_.host.c_str(), config_.port);
+        bool ok = svr_->bind_to_port(config_.host.c_str(), config_.port);
+        if (!ok) {
+            std::cerr << "Failed to bind to " << config_.host << ":" << config_.port << "\n";
+            running_.store(false);
+            return;
+        }
+        ready_.store(true);
+        svr_->listen_after_bind();
+        ready_.store(false);
         running_.store(false);
     });
 }
 
 void HttpServer::stop() {
+    stop_requested_.store(true);
     {
         std::lock_guard<std::mutex> lock(svr_mutex_);
         if (svr_ != nullptr) {
@@ -161,6 +245,10 @@ void HttpServer::stop() {
 
 bool HttpServer::is_running() const {
     return running_.load();
+}
+
+bool HttpServer::ready() const {
+    return ready_.load();
 }
 
 std::vector<RequestLogEntry> HttpServer::recent_requests(size_t limit) const {
@@ -180,22 +268,84 @@ void HttpServer::set_request_callback(std::function<void(const RequestLogEntry&)
     request_callback_ = std::move(cb);
 }
 
-namespace {
+HttpServer::GenerationSlot::GenerationSlot(HttpServer& server)
+    : server_(&server)
+    , acquired_(false) {
+    // Reserve a place in the queue; reject immediately if it is full.
+    int expected = server_->queued_generations_.load();
+    while (true) {
+        if (expected >= HttpServer::kMaxQueueDepth) {
+            return;
+        }
+        if (server_->queued_generations_.compare_exchange_weak(expected, expected + 1)) {
+            break;
+        }
+    }
 
-std::string format_log_time() {
-    auto now = std::chrono::system_clock::now();
-    auto t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-    localtime_r(&t, &tm);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%H:%M:%S");
-    return oss.str();
+    // Wait until the engine is free, then take it.
+    lock_ = std::unique_lock<std::mutex>(server_->engine_mutex_);
+    server_->queued_generations_--;
+    server_->active_generations_++;
+    acquired_ = true;
 }
 
-} // namespace
+HttpServer::GenerationSlot::GenerationSlot(GenerationSlot&& other) noexcept
+    : server_(other.server_)
+    , acquired_(other.acquired_)
+    , lock_(std::move(other.lock_)) {
+    other.server_ = nullptr;
+    other.acquired_ = false;
+}
+
+HttpServer::GenerationSlot& HttpServer::GenerationSlot::operator=(GenerationSlot&& other) noexcept {
+    if (this != &other) {
+        // Release any currently held slot.
+        if (acquired_ && server_ != nullptr) {
+            server_->active_generations_--;
+        }
+        lock_.unlock();
+
+        server_ = other.server_;
+        acquired_ = other.acquired_;
+        lock_ = std::move(other.lock_);
+        other.server_ = nullptr;
+        other.acquired_ = false;
+    }
+    return *this;
+}
+
+HttpServer::GenerationSlot::~GenerationSlot() {
+    if (acquired_ && server_ != nullptr) {
+        server_->active_generations_--;
+    }
+    // lock_ is released here; the next waiter can proceed.
+}
+
+void HttpServer::emit_json_log(const RequestLogEntry& entry) {
+    json j;
+    j["timestamp"] = format_log_time_iso();
+    j["request_id"] = entry.request_id;
+    j["method"] = entry.method;
+    j["path"] = entry.path;
+    j["status"] = entry.status;
+    j["tokens"] = entry.tokens;
+    j["seconds"] = entry.seconds;
+    if (!entry.error_message.empty()) {
+        j["error"] = entry.error_message;
+    }
+    const std::string line = j.dump();
+    if (config_.json_logs) {
+        std::cerr << line << "\n";
+    }
+    if (log_stream_.is_open()) {
+        log_stream_ << line << "\n";
+        log_stream_.flush();
+    }
+}
 
 void HttpServer::record_request(const httplib::Request& req, const httplib::Response& res,
-                                int tokens, double seconds) {
+                                int tokens, double seconds, const std::string& request_id,
+                                const std::string& error_message) {
     RequestLogEntry entry;
     entry.time   = format_log_time();
     entry.method = req.method;
@@ -203,6 +353,8 @@ void HttpServer::record_request(const httplib::Request& req, const httplib::Resp
     entry.status = res.status;
     entry.tokens = tokens;
     entry.seconds = seconds;
+    entry.request_id = request_id;
+    entry.error_message = error_message;
 
     {
         std::lock_guard<std::mutex> lock(log_mutex_);
@@ -214,25 +366,41 @@ void HttpServer::record_request(const httplib::Request& req, const httplib::Resp
             request_callback_(entry);
         }
     }
+    emit_json_log(entry);
 }
 
 void HttpServer::set_cors_headers(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID");
+    res.set_header("Access-Control-Max-Age", "86400");
+}
+
+void HttpServer::handle_options(const httplib::Request& /*req*/, httplib::Response& res) {
+    set_cors_headers(res);
+    res.status = 204;
 }
 
 void HttpServer::handle_health(const httplib::Request& req, httplib::Response& res) {
     (void)req;
     set_cors_headers(res);
 
+    const auto uptime_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start_time_).count();
+
     json response;
     response["status"] = "ok";
+    response["ready"] = ready_.load();
+    response["uptime_seconds"] = uptime_s;
     response["model"] = engine_.get_model_info();
     response["sharding"] = engine_.is_sharded();
     response["layers"] = engine_.n_layer();
     response["embedding_dim"] = engine_.embedding_dim();
     response["vocab_size"] = engine_.vocab_size();
+    response["version"] = "0.1.0";
+    response["active_generations"] = active_generations_.load();
+    response["queued_generations"] = queued_generations_.load();
+    response["max_queue_depth"] = kMaxQueueDepth;
 
     res.set_content(response.dump(), "application/json");
 }
@@ -243,7 +411,7 @@ void HttpServer::handle_models(const httplib::Request& req, httplib::Response& r
 
     json response;
     json model_info;
-    model_info["id"] = engine_.get_model_info();
+    model_info["id"] = engine_.get_model_id();
     model_info["object"] = "model";
     model_info["created"] = static_cast<int64_t>(std::time(nullptr));
     model_info["owned_by"] = "gizmo";
@@ -254,12 +422,81 @@ void HttpServer::handle_models(const httplib::Request& req, httplib::Response& r
     res.set_content(response.dump(), "application/json");
 }
 
+std::string HttpServer::format_chat_messages(
+    const std::vector<std::pair<std::string, std::string>>& messages,
+    bool add_assistant) {
+    if (!engine_.raw_model() || messages.empty()) {
+        return "";
+    }
+
+    const char* tmpl = llama_model_chat_template(engine_.raw_model(), /*name=*/nullptr);
+    std::vector<llama_chat_message> chat;
+    chat.reserve(messages.size());
+    for (const auto& m : messages) {
+        chat.push_back({m.first.c_str(), m.second.c_str()});
+    }
+
+    std::string buf(4096, '\0');
+    int32_t needed = llama_chat_apply_template(
+        tmpl, chat.data(), chat.size(), add_assistant, buf.data(), static_cast<int32_t>(buf.size()));
+    if (needed < 0) {
+        return "";
+    }
+    if (needed > static_cast<int32_t>(buf.size())) {
+        buf.resize(static_cast<size_t>(needed) + 1);
+        needed = llama_chat_apply_template(
+            tmpl, chat.data(), chat.size(), add_assistant, buf.data(), static_cast<int32_t>(buf.size()));
+    }
+    if (needed <= 0) {
+        return "";
+    }
+    return std::string(buf.data(), static_cast<size_t>(needed));
+}
+
+namespace {
+
+InferenceConfig parse_inference_config(const json& request_json) {
+    InferenceConfig config;
+    if (request_json.contains("max_tokens")) {
+        config.max_tokens = request_json["max_tokens"].get<int32_t>();
+    }
+    if (request_json.contains("temperature")) {
+        config.temperature = request_json["temperature"].get<float>();
+    }
+    if (request_json.contains("top_p")) {
+        config.top_p = request_json["top_p"].get<float>();
+    }
+    if (request_json.contains("top_k")) {
+        config.top_k = request_json["top_k"].get<int32_t>();
+    }
+    if (request_json.contains("seed")) {
+        config.seed = request_json["seed"].get<int32_t>();
+    }
+    if (request_json.contains("stop")) {
+        const auto& stop_field = request_json["stop"];
+        if (stop_field.is_string()) {
+            config.stop.push_back(stop_field.get<std::string>());
+        } else if (stop_field.is_array()) {
+            for (const auto& s : stop_field) {
+                if (s.is_string()) {
+                    config.stop.push_back(s.get<std::string>());
+                }
+            }
+        }
+    }
+    return config;
+}
+
+} // namespace
+
 void HttpServer::handle_completions(const httplib::Request& req, httplib::Response& res) {
+    const std::string request_id = request_id_from_header(req);
     set_cors_headers(res);
 
     json request_json;
     if (!parse_json_body(req, request_json)) {
         send_error(res, 400, "Invalid JSON body");
+        record_request(req, res, 0, 0.0, request_id, "Invalid JSON body");
         return;
     }
 
@@ -278,55 +515,45 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
 
     if (prompt.empty()) {
         send_error(res, 400, "Missing or empty 'prompt' field");
+        record_request(req, res, 0, 0.0, request_id, "Missing or empty 'prompt' field");
         return;
     }
 
-    int32_t max_tokens = 256;
-    if (request_json.contains("max_tokens")) {
-        max_tokens = request_json["max_tokens"].get<int32_t>();
-    }
+    InferenceConfig config = parse_inference_config(request_json);
 
-    float temperature = 0.8f;
-    if (request_json.contains("temperature")) {
-        temperature = request_json["temperature"].get<float>();
+    GenerationSlot slot(*this);
+    if (!slot.acquired()) {
+        send_error(res, 503, "Server is busy; too many queued generation requests");
+        record_request(req, res, 0, 0.0, request_id, "Server busy");
+        return;
     }
-
-    float top_p = 0.95f;
-    if (request_json.contains("top_p")) {
-        top_p = request_json["top_p"].get<float>();
-    }
-
-    int32_t top_k = 40;
-    if (request_json.contains("top_k")) {
-        top_k = request_json["top_k"].get<int32_t>();
-    }
-
-    // Generate completion
-    InferenceConfig config;
-    config.max_tokens = max_tokens;
-    config.temperature = temperature;
-    config.top_p = top_p;
-    config.top_k = top_k;
 
     engine_.reset_for_next_run();
 
     std::string completion;
     int completion_tokens = 0;
     const auto t0 = std::chrono::steady_clock::now();
+
+    auto timeout = std::chrono::steady_clock::now() +
+                   std::chrono::seconds(config_.request_timeout_seconds);
+    auto should_cancel = [this, timeout]() {
+        return stop_requested_.load() || std::chrono::steady_clock::now() > timeout;
+    };
+
     bool ok = engine_.generate_stream(prompt, config,
         [&completion, &completion_tokens](const std::string& token_text, int32_t /*token_id*/) {
             completion += token_text;
             ++completion_tokens;
-        });
+        }, should_cancel);
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
 
     // Build OpenAI-compatible response
     json response;
-    response["id"] = "cmpl-" + std::to_string(std::time(nullptr));
+    response["id"] = "cmpl-" + request_id;
     response["object"] = "text_completion";
     response["created"] = static_cast<int64_t>(std::time(nullptr));
-    response["model"] = engine_.get_model_info();
+    response["model"] = engine_.get_model_id();
 
     json choice;
     choice["index"] = 0;
@@ -343,64 +570,68 @@ void HttpServer::handle_completions(const httplib::Request& req, httplib::Respon
     usage["total_tokens"] = prompt_tokens + completion_tokens;
     response["usage"] = usage;
 
+    res.status = 200;
     res.set_content(response.dump(), "application/json");
-    record_request(req, res, prompt_tokens + completion_tokens, elapsed);
+    record_request(req, res, prompt_tokens + completion_tokens, elapsed, request_id,
+                   ok ? "" : "Generation failed or timed out");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    const std::string request_id = request_id_from_header(req);
     set_cors_headers(res);
 
     json request_json;
     if (!parse_json_body(req, request_json)) {
         send_error(res, 400, "Invalid JSON body");
+        record_request(req, res, 0, 0.0, request_id, "Invalid JSON body");
         return;
     }
 
     // Parse messages
-    std::string prompt;
+    std::vector<std::pair<std::string, std::string>> messages;
     if (request_json.contains("messages") && request_json["messages"].is_array()) {
         for (const auto& msg : request_json["messages"]) {
             std::string role = msg.value("role", "");
             std::string content = msg.value("content", "");
-            if (role == "system") {
-                prompt = "System: " + content + "\n";
-            } else if (role == "user") {
-                prompt += "User: " + content + "\n";
-            } else if (role == "assistant") {
-                prompt += "Assistant: " + content + "\n";
-            }
+            if (role.empty()) continue;
+            messages.emplace_back(role, content);
         }
-        prompt += "Assistant: ";
     } else {
         send_error(res, 400, "Missing or invalid 'messages' array");
+        record_request(req, res, 0, 0.0, request_id, "Missing or invalid 'messages' array");
         return;
     }
 
-    int32_t max_tokens = 256;
-    if (request_json.contains("max_tokens")) {
-        max_tokens = request_json["max_tokens"].get<int32_t>();
+    // Use the model's built-in chat template when available; fall back to the
+    // legacy plain-text join so older models and unit tests still work.
+    std::string prompt = format_chat_messages(messages, /*add_assistant=*/true);
+    if (prompt.empty()) {
+        for (const auto& msg : messages) {
+            if (msg.first == "system") {
+                prompt = "System: " + msg.second + "\n";
+            } else if (msg.first == "user") {
+                prompt += "User: " + msg.second + "\n";
+            } else if (msg.first == "assistant") {
+                prompt += "Assistant: " + msg.second + "\n";
+            }
+        }
+        prompt += "Assistant: ";
     }
 
-    float temperature = 0.8f;
-    if (request_json.contains("temperature")) {
-        temperature = request_json["temperature"].get<float>();
-    }
-
-    float top_p = 0.95f;
-    if (request_json.contains("top_p")) {
-        top_p = request_json["top_p"].get<float>();
-    }
+    InferenceConfig config = parse_inference_config(request_json);
 
     bool stream = false;
     if (request_json.contains("stream")) {
         stream = request_json["stream"].get<bool>();
     }
 
-    // Generate completion
-    InferenceConfig config;
-    config.max_tokens = max_tokens;
-    config.temperature = temperature;
-    config.top_p = top_p;
+    // Serialize all generation requests; reject if the queue is full.
+    GenerationSlot slot(*this);
+    if (!slot.acquired()) {
+        send_error(res, 503, "Server is busy; too many queued generation requests");
+        record_request(req, res, 0, 0.0, request_id, "Server busy");
+        return;
+    }
 
     engine_.reset_for_next_run();
 
@@ -410,21 +641,40 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         // content provider. Count generated tokens for logging; usage is
         // not included in SSE chunks by default.
         auto queue = std::make_shared<StreamChunkQueue>();
-        const std::string model_info = engine_.get_model_info();
+        const std::string model_id = engine_.get_model_id();
         const int prompt_tokens = count_tokens(engine_.raw_model(), prompt);
 
-        std::thread gen_thread([this, prompt, config, queue, model_info, prompt_tokens]() {
+        // Capture request metadata by value so the detached logging thread is
+        // safe after handle_chat_completions returns.
+        const std::string req_method = req.method;
+        const std::string req_path = req.path;
+        const int response_status = 200;
+
+        std::thread gen_thread([this, prompt, config, queue, model_id, request_id,
+                                req_method, req_path, response_status, prompt_tokens,
+                                slot = std::move(slot)]() mutable {
             bool first = true;
             int completion_tokens = 0;
             const auto t0 = std::chrono::steady_clock::now();
+            auto timeout = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(config_.request_timeout_seconds);
+            auto should_cancel = [this, timeout, queue]() {
+                if (stop_requested_.load() || std::chrono::steady_clock::now() > timeout) {
+                    queue->close();
+                    return true;
+                }
+                return false;
+            };
+
             bool ok = engine_.generate_stream(prompt, config,
-                [queue, &first, model_info, &completion_tokens](const std::string& token_text, int32_t) {
+                [queue, &first, model_id, &completion_tokens](const std::string& token_text, int32_t) {
+                    if (queue->is_closed()) return;
                     ++completion_tokens;
                     json chunk;
-                    chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+                    chunk["id"] = "chatcmpl-" + model_id;
                     chunk["object"] = "chat.completion.chunk";
                     chunk["created"] = static_cast<int64_t>(std::time(nullptr));
-                    chunk["model"] = model_info;
+                    chunk["model"] = model_id;
 
                     json choice;
                     choice["index"] = 0;
@@ -440,16 +690,20 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
 
                     std::string sse = "data: " + chunk.dump() + "\n\n";
                     queue->push(sse);
-                });
+                }, should_cancel);
             const double elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
 
+            if (queue->is_closed()) {
+                return;
+            }
+
             // Final chunk with finish_reason="stop" (or "error" on failure).
             json final_chunk;
-            final_chunk["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+            final_chunk["id"] = "chatcmpl-" + model_id;
             final_chunk["object"] = "chat.completion.chunk";
             final_chunk["created"] = static_cast<int64_t>(std::time(nullptr));
-            final_chunk["model"] = model_info;
+            final_chunk["model"] = model_id;
 
             json final_choice;
             final_choice["index"] = 0;
@@ -460,8 +714,14 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             queue->push("data: " + final_chunk.dump() + "\n\n");
             queue->push("data: [DONE]\n\n");
             queue->close();
-            (void)prompt_tokens;
-            (void)elapsed;
+
+            httplib::Request fake_req;
+            fake_req.method = req_method;
+            fake_req.path = req_path;
+            httplib::Response fake_res;
+            fake_res.status = response_status;
+            record_request(fake_req, fake_res, prompt_tokens + completion_tokens, elapsed, request_id,
+                           ok ? "" : "Streaming generation failed or timed out");
         });
         gen_thread.detach();
 
@@ -481,27 +741,31 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
                 return false;
             });
-        record_request(req, res, prompt_tokens, 0.0);
         return;
     }
 
     std::string completion;
     int completion_tokens = 0;
     const auto t0 = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::steady_clock::now() +
+                   std::chrono::seconds(config_.request_timeout_seconds);
+    auto should_cancel = [this, timeout]() {
+        return stop_requested_.load() || std::chrono::steady_clock::now() > timeout;
+    };
     bool ok = engine_.generate_stream(prompt, config,
         [&completion, &completion_tokens](const std::string& token_text, int32_t /*token_id*/) {
             completion += token_text;
             ++completion_tokens;
-        });
+        }, should_cancel);
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
 
     // Build OpenAI-compatible response
     json response;
-    response["id"] = "chatcmpl-" + std::to_string(std::time(nullptr));
+    response["id"] = "chatcmpl-" + request_id;
     response["object"] = "chat.completion";
     response["created"] = static_cast<int64_t>(std::time(nullptr));
-    response["model"] = engine_.get_model_info();
+    response["model"] = engine_.get_model_id();
 
     json choice;
     choice["index"] = 0;
@@ -521,8 +785,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     usage["total_tokens"] = prompt_tokens + completion_tokens;
     response["usage"] = usage;
 
+    res.status = 200;
     res.set_content(response.dump(), "application/json");
-    record_request(req, res, prompt_tokens + completion_tokens, elapsed);
+    record_request(req, res, prompt_tokens + completion_tokens, elapsed, request_id,
+                   ok ? "" : "Generation failed or timed out");
 }
 
 bool HttpServer::parse_json_body(const httplib::Request& req, json& out_json) {

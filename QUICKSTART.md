@@ -30,8 +30,8 @@ cmake --build build -j$(nproc)
 # Launch the interactive chat TUI (pick a model, then chat with live speed/RSS footer)
 ./build/gizmo chat
 
-# Or launch the server dashboard TUI instead
-./build/gizmo tui -m /path/to/model.gguf
+# Or launch the interactive server dashboard TUI
+./build/gizmo tui
 
 # Run a model with a prompt
 ./build/gizmo run -m /path/to/model.gguf -p "Hello!"
@@ -66,9 +66,13 @@ cmake --build build -j$(nproc)
 # Add custom model directories (colon-separated; also use GIZMO_MODEL_PATH)
 ./build/gizmo chat --model-path ~/models:/data/ggufs
 
-# HTTP server (OpenAI-compatible; `serve` and `server` both work)
+# HTTP server (OpenAI-compatible; `serve` and `server` both work, require `-m`)
 ./build/gizmo serve -m /path/to/model.gguf --port 8080 --cors
 ./build/gizmo server -m /path/to/model.gguf --port 8080
+
+# Production-style serving with structured logs and a 60 s timeout
+./build/gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080 \
+  --cors --request-timeout 60 --json-logs --log-file /tmp/gizmo.log
 
 curl http://127.0.0.1:8080/v1/health
 curl http://127.0.0.1:8080/v1/models
@@ -90,7 +94,18 @@ curl http://127.0.0.1:8080/v1/models
 - ✅ Shared model discovery used by chat TUI and server TUI
 - ✅ `--model-path` / `GIZMO_MODEL_PATH` for custom model search directories
 - ✅ `serve` command alias and `/v1/health`, `/v1/` endpoints
+- ✅ Headless `gizmo serve -m` for production/Docker use
+- ✅ Graceful shutdown, request timeouts, bounded generation queue, and structured JSON logs
+- ✅ Multi-stage `Dockerfile` and GitHub Actions release workflow
 - ⏳ Built-in model download via libcurl
+
+## Docker
+
+```bash
+docker build -t gizmo .
+docker run -p 8080:8080 -v /path/to/models:/models:ro gizmo \
+  serve -m /models/model.gguf --cors --host 0.0.0.0
+```
 
 ## Architecture
 

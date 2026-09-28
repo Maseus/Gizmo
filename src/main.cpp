@@ -1285,8 +1285,26 @@ int main(int argc, char* argv[]) {
             return ok ? 0 : 1;
         }
 
-        case gizmo::CommandType::Tui:
-            // fallthrough
+        case gizmo::CommandType::Tui: {
+            gizmo::ServeSettings settings;
+            settings.model_path = options.model;
+            auto dirs = model_search_dirs(options.model_path);
+            settings.model_path_extra = join_colon_dirs(dirs);
+            settings.host = options.host;
+            settings.port = options.port;
+            settings.threads = options.server_threads;
+            settings.request_timeout_seconds = options.request_timeout_seconds;
+            settings.log_file = options.log_file;
+            settings.json_logs = options.json_logs;
+            settings.cors = options.cors;
+            settings.no_evict = options.no_evict;
+            settings.verbose = options.verbose;
+            settings.no_shard = options.no_shard;
+            settings.resident_layers = options.resident_layers.empty() ? 8 : options.resident_layers[0];
+            settings.row_size = options.row_size.empty() ? 1 : options.row_size[0];
+            return gizmo::run_server_tui(settings);
+        }
+
         case gizmo::CommandType::Serve:
             // fallthrough
         case gizmo::CommandType::Server: {
@@ -1301,10 +1319,16 @@ int main(int argc, char* argv[]) {
             settings.host = options.host;
             settings.port = options.port;
             settings.threads = options.server_threads;
+            settings.request_timeout_seconds = options.request_timeout_seconds;
+            settings.log_file = options.log_file;
+            settings.json_logs = options.json_logs;
             settings.cors = options.cors;
             settings.no_evict = options.no_evict;
             settings.verbose = options.verbose;
-            return gizmo::run_server_tui(settings);
+            settings.no_shard = options.no_shard;
+            settings.resident_layers = options.resident_layers.empty() ? 8 : options.resident_layers[0];
+            settings.row_size = options.row_size.empty() ? 1 : options.row_size[0];
+            return gizmo::run_server_headless(settings);
         }
 
         case gizmo::CommandType::Run: {
