@@ -15,6 +15,7 @@ struct ServeSettings {
     int32_t threads = 4;
     int32_t max_tokens = 128;
     int32_t request_timeout_seconds = 300;
+    int32_t context_size = 0;
     std::string log_file;
     bool json_logs = false;
     bool cors = false;

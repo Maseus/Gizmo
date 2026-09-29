@@ -13,13 +13,20 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
+#include <functional>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -281,7 +288,8 @@ static int do_validate(
     bool json_output,
     bool argmax_only,
     float max_diff_threshold,
-    float mean_diff_threshold
+    float mean_diff_threshold,
+    int32_t context_size
 ) {
     // Built-in prompt suite. Mix of lengths and content to exercise
     // embedding lookup, causal attention, and (on qwen3.5) hybrid
@@ -364,6 +372,7 @@ static int do_validate(
     baseline_engine.set_verbose(verbose);
     baseline_engine.set_progress(progress);
     baseline_engine.set_threads(threads);
+    baseline_engine.set_context_size(context_size);
     if (!baseline_engine.initialize(model_path, /*layer_shard_lazy=*/false)) {
         std::cerr << "[validate] failed to load model (baseline): " << model_path << "\n";
         return 1;
@@ -380,6 +389,7 @@ static int do_validate(
     sharded_engine.set_verbose(verbose);
     sharded_engine.set_progress(progress);
     sharded_engine.set_threads(threads);
+    sharded_engine.set_context_size(context_size);
     if (!sharded_engine.initialize(model_path, /*layer_shard_lazy=*/true)) {
         std::cerr << "[validate] failed to load model (sharded): " << model_path << "\n";
         return 1;
@@ -512,6 +522,7 @@ static int do_chat(
     int32_t row_size,
     int32_t threads,
     int32_t max_tokens,
+    int32_t context_size,
     bool measure_ram,
     int32_t measure_interval_ms,
     bool verbose,
@@ -521,6 +532,7 @@ static int do_chat(
     engine.set_verbose(verbose);
     engine.set_progress(progress);
     engine.set_threads(threads);
+    engine.set_context_size(context_size);
     if (!engine.initialize(model_path, /*layer_shard_lazy=*/!no_shard)) {
         std::cerr << "Failed to initialize inference engine\n";
         return 1;
@@ -899,7 +911,333 @@ static int do_sweep(
     return 0;
 }
 
-static int do_bench(const std::string& model_path, bool prefill_only, int32_t resident_layers, bool no_evict, int32_t row_size, int32_t threads) {
+// ---------------------------------------------------------------------------
+// Launch helpers
+// ---------------------------------------------------------------------------
+
+// Poll a local HTTP endpoint until it reports ready or the deadline expires.
+// `path` is appended to http://host:port (e.g. "/v1/health" or "/health").
+static bool wait_for_server_ready(const std::string& host, int32_t port,
+                                    const std::string& path,
+                                    int32_t timeout_seconds) {
+    const std::string url = "http://" + host + ":" + std::to_string(port) + path;
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::seconds(timeout_seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        // Use curl via system() so we do not add a dependency on libcurl.
+        const std::string cmd = "curl -s --max-time 2 " + url + " > /dev/null 2>&1";
+        if (std::system(cmd.c_str()) == 0) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    return false;
+}
+
+// Return a host string suitable for a client to connect to. When the server
+// is bound to 0.0.0.0, clients should connect via localhost.
+static std::string client_host(const std::string& bind_host) {
+    if (bind_host == "0.0.0.0") return "127.0.0.1";
+    return bind_host;
+}
+
+static bool command_exists(const char* name) {
+    const std::string cmd = std::string("command -v ") + name + " > /dev/null 2>&1";
+    return std::system(cmd.c_str()) == 0;
+}
+
+static std::string find_claude_executable() {
+    if (command_exists("claude"))        return "claude";
+    if (command_exists("claude-code"))   return "claude-code";
+    if (command_exists("claude-desktop")) return "claude-desktop";
+    return "";
+}
+
+// Start a child process. Returns the PID on success, -1 on failure.
+// The command is executed directly (execvp) so shell quoting is not needed.
+static pid_t start_child_process(const std::string& exe,
+                                  const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.push_back(const_cast<char*>(exe.c_str()));
+    for (const auto& a : args) {
+        argv.push_back(const_cast<char*>(a.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid == 0) {
+        // Child: redirect stdout/stderr to our own so server logs appear inline.
+        // We intentionally do not detach so Gizmo can terminate the process.
+        execvp(exe.c_str(), argv.data());
+        std::perror("execvp failed");
+        _exit(127);
+    }
+    return pid;
+}
+
+// Send SIGTERM, then SIGKILL if the process is still alive after a short wait.
+static void terminate_child(pid_t pid) {
+    if (pid <= 0) return;
+    kill(pid, SIGTERM);
+    for (int i = 0; i < 50; ++i) {
+        if (kill(pid, 0) != 0) return; // process is gone
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    kill(pid, SIGKILL);
+}
+
+// Launch the Claude Code CLI pointed at `base_url` with `model_id`.
+// If the CLI is not installed, prints the manual connection command and
+// returns after the user interrupts us. `server_is_running` and
+// `stop_requested` are polled so the fallback exits cleanly.
+static int launch_claude_client(
+    const std::string& base_url,
+    const std::string& model_id,
+    std::function<bool()> server_is_running,
+    std::function<bool()> stop_requested
+) {
+    const std::string env_prefix =
+        "OPENAI_BASE_URL=" + base_url + " "
+        "OPENAI_API_KEY=gizmo ";
+
+    const std::string launch_cmd = find_claude_executable();
+    std::cout << "  endpoint:    " + base_url + "\n";
+    std::cout << "  model id:    " + model_id + "\n";
+    std::cout.flush();
+
+    if (launch_cmd.empty()) {
+        std::cout << "\nClaude Code CLI not found in PATH.\n"
+                  << "To connect Claude Code to this server, run in another terminal:\n\n"
+                  << "  " << env_prefix << "claude\n\n"
+                  << "Or set the model explicitly with:\n\n"
+                  << "  " << env_prefix
+                  << "OPENAI_MODEL=" << model_id << " claude\n\n"
+                  << "Press Ctrl+C to stop the server.\n";
+        std::cout.flush();
+
+        while (server_is_running() && !stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return 0;
+    }
+
+    std::cout << "  launching:   " << launch_cmd << "\n";
+    std::cout.flush();
+
+    const std::string full_cmd = env_prefix + "OPENAI_MODEL=" + model_id + " " + launch_cmd;
+    const int claude_exit = std::system(full_cmd.c_str());
+
+    std::cout << "Claude exited (" << claude_exit << ").\n";
+    return WIFEXITED(claude_exit) ? WEXITSTATUS(claude_exit) : 1;
+}
+
+// Start a background Gizmo server for the given model and settings, then
+// launch Claude Code configured to talk to it over the OpenAI-compatible
+// API. When Claude exits, the server is stopped.
+static int do_launch_gizmo_claude(const gizmo::CliOptions& options) {
+    gizmo::ServeSettings settings;
+    settings.model_path = options.model;
+    auto dirs = gizmo::build_search_dirs(gizmo::parse_colon_dirs(options.extra_model_dirs));
+    settings.model_path_extra = gizmo::join_colon_dirs(dirs);
+    settings.host = options.host;
+    settings.port = options.port;
+    settings.threads = options.server_threads;
+    settings.request_timeout_seconds = options.request_timeout_seconds;
+    settings.context_size = options.context_size;
+    settings.log_file = options.log_file;
+    settings.json_logs = options.json_logs;
+    settings.cors = options.cors;
+    settings.no_evict = options.no_evict;
+    settings.verbose = options.verbose;
+    settings.no_shard = options.no_shard;
+    settings.resident_layers = options.resident_layers.empty() ? 8 : options.resident_layers[0];
+    settings.row_size = options.row_size.empty() ? 1 : options.row_size[0];
+
+    std::cout << "Starting Gizmo server for Claude on http://"
+              << settings.host << ":" << settings.port << "\n";
+    std::cout << "Model: " << options.model << "\n";
+    if (options.context_size > 0) {
+        std::cout << "Context size: " << options.context_size << "\n";
+    } else {
+        std::cout << "Context size: auto (RAM-aware)\n";
+    }
+    std::cout.flush();
+
+    gizmo::InferenceEngine engine;
+    engine.set_verbose(settings.verbose);
+    engine.set_threads(settings.threads);
+    engine.set_context_size(settings.context_size);
+    if (!engine.initialize(settings.model_path, /*layer_shard_lazy=*/!settings.no_shard)) {
+        std::cerr << "\nFailed to initialize inference engine for: " << settings.model_path << "\n";
+        return 1;
+    }
+
+    if (!settings.no_shard) {
+        const int32_t resident = settings.resident_layers > 0 ? settings.resident_layers : 8;
+        const int32_t row = settings.row_size > 0 ? settings.row_size : 1;
+        engine.enable_sharded_engine(resident, /*evict_weights=*/!settings.no_evict, row);
+        if (!engine.is_sharded()) {
+            std::cout << "Note: sharded engine was not enabled; falling back to llama_decode.\n";
+        }
+    }
+
+    gizmo::ServerConfig config;
+    config.host = settings.host;
+    config.port = settings.port;
+    config.threads = settings.threads;
+    config.cors = settings.cors;
+    config.request_timeout_seconds = settings.request_timeout_seconds;
+    config.log_file = settings.log_file;
+    config.json_logs = settings.json_logs;
+
+    gizmo::HttpServer server(engine, config);
+    server.install_signal_handlers(&server);
+    server.start();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (!server.is_running()) {
+        std::cerr << "\nFailed to start HTTP server on " << settings.host << ":" << settings.port << "\n";
+        return 1;
+    }
+
+    std::cout << "Waiting for server to be ready...\n";
+    std::cout.flush();
+    if (!wait_for_server_ready(client_host(settings.host), settings.port, "/v1/health", /*timeout_seconds=*/30)) {
+        std::cerr << "\nServer did not become ready within 30 seconds.\n";
+        server.stop();
+        return 1;
+    }
+
+    std::cout << "Server ready.\n";
+    std::cout.flush();
+
+    const std::string base_url = "http://" + client_host(settings.host) + ":" + std::to_string(settings.port) + "/v1";
+    const int claude_exit = launch_claude_client(
+        base_url,
+        engine.get_model_id(),
+        [&server]() { return server.is_running(); },
+        [&server]() { return server.stop_requested(); }
+    );
+
+    std::cout << "Stopping Gizmo server...\n";
+    server.stop();
+    return claude_exit;
+}
+
+// Launch Claude Code connected to a Rux disk-KV backend. Rux serves
+// HuggingFace models over an OpenAI-compatible API with the KV cache
+// kept on disk, so long contexts fit on modest RAM.
+static int do_launch_rux_claude(const gizmo::CliOptions& options) {
+    if (options.model.empty()) {
+        std::cerr << "Error: --model required (HuggingFace model id for backend=rux)\n"
+                  << "Usage: gizmo launch claude --backend rux -m <hf-model-id> [--port <N>]\n";
+        return 1;
+    }
+
+    // Locate the `rux` executable.
+    std::string rux_exe = options.rux_path;
+    if (rux_exe.empty()) {
+        if (command_exists("rux")) {
+            rux_exe = "rux";
+        } else {
+            const char* home = std::getenv("HOME");
+            std::vector<std::string> candidates;
+            if (home != nullptr) {
+                candidates.emplace_back(std::string(home) + "/Desktop/Rux/Rux/venv/bin/rux");
+                candidates.emplace_back(std::string(home) + "/.local/bin/rux");
+            }
+            candidates.emplace_back("/usr/local/bin/rux");
+            for (const auto& c : candidates) {
+                if (std::filesystem::exists(c) && std::filesystem::is_regular_file(c)) {
+                    rux_exe = c;
+                    break;
+                }
+            }
+        }
+    }
+    if (rux_exe.empty()) {
+        std::cerr << "Error: `rux` executable not found.\n"
+                  << "Install Rux or pass --rux-path /path/to/rux\n";
+        return 1;
+    }
+
+    const int32_t max_seq_len = options.context_size > 0 ? options.context_size : 262144;
+
+    std::cout << "Starting Rux server for Claude on http://"
+              << options.host << ":" << options.port << "\n";
+    std::cout << "Backend: rux\n";
+    std::cout << "Model:   " << options.model << "\n";
+    std::cout << "Context: " << max_seq_len << " tokens (disk-backed KV)\n";
+    std::cout.flush();
+
+    std::vector<std::string> rux_args = {
+        "serve",
+        "--host", options.host,
+        "--port", std::to_string(options.port),
+        "--max-seq-len", std::to_string(max_seq_len),
+        "--chunk-size", "128",
+    };
+
+    pid_t rux_pid = start_child_process(rux_exe, rux_args);
+    if (rux_pid < 0) {
+        std::cerr << "\nFailed to start Rux server.\n";
+        return 1;
+    }
+
+    std::cout << "Waiting for Rux server to be ready...\n";
+    std::cout.flush();
+    if (!wait_for_server_ready(client_host(options.host), options.port, "/health", /*timeout_seconds=*/60)) {
+        std::cerr << "\nRux server did not become ready within 60 seconds.\n";
+        terminate_child(rux_pid);
+        return 1;
+    }
+
+    std::cout << "Rux server ready.\n";
+    std::cout.flush();
+
+    const std::string base_url = "http://" + client_host(options.host) + ":" + std::to_string(options.port) + "/v1";
+    std::atomic<bool> rux_alive{true};
+    std::thread reaper([rux_pid, &rux_alive]() {
+        int status = 0;
+        pid_t waited = waitpid(rux_pid, &status, 0);
+        // waitpid returns the PID when the child exits (for any reason) or -1 on
+        // error. In either case the server is no longer usable, so signal the
+        // client loop to stop waiting.
+        rux_alive = false;
+        (void)waited;
+        (void)status;
+    });
+
+    const int claude_exit = launch_claude_client(
+        base_url,
+        options.model,
+        [&rux_alive]() { return rux_alive.load(); },
+        []() { return false; }
+    );
+
+    std::cout << "Stopping Rux server...\n";
+    terminate_child(rux_pid);
+    reaper.join();
+    return claude_exit;
+}
+
+// Dispatch launch claude to the selected backend.
+static int do_launch_claude(const gizmo::CliOptions& options) {
+    if (options.backend == "rux") {
+        return do_launch_rux_claude(options);
+    }
+    if (options.backend != "gizmo") {
+        std::cerr << "Error: unknown backend '" << options.backend
+                  << "'; supported backends are 'gizmo' (default) and 'rux'.\n";
+        return 1;
+    }
+    return do_launch_gizmo_claude(options);
+}
+
+static int do_bench(const std::string& model_path, bool prefill_only, int32_t resident_layers, bool no_evict, int32_t row_size, int32_t threads, int32_t context_size) {
     // Build a fixed prompt template and tokenize it once. Then
     // for each (N, path) we re-detokenize the first N tokens
     // back to a string and pass it to engine.generate(). This
@@ -922,6 +1260,7 @@ static int do_bench(const std::string& model_path, bool prefill_only, int32_t re
     // behavior rather than a model that was already fully faulted in.
     gizmo::InferenceEngine engine;
     engine.set_threads(threads);
+    engine.set_context_size(context_size);
     if (!engine.initialize(model_path, /*layer_shard_lazy=*/true)) {
         std::cerr << "Failed to load model for bench: " << model_path << "\n";
         return 1;
@@ -1056,10 +1395,12 @@ int main(int argc, char* argv[]) {
                     std::cout << " " << std::fixed << std::setprecision(1) << p << "B params";
                 }
                 std::cout << "\n       " << path << "\n";
-                if (info.total_layers > 0 || info.embedding_dim > 0 || info.vocab_size > 0) {
+                if (info.total_layers > 0 || info.embedding_dim > 0 ||
+                    info.vocab_size > 0 || info.context_length > 0) {
                     std::cout << "       layers=" << info.total_layers
                               << " embd=" << info.embedding_dim
                               << " vocab=" << info.vocab_size
+                              << " ctx=" << info.context_length
                               << " size=" << info.size_bytes << " bytes\n";
                 }
             }
@@ -1074,7 +1415,8 @@ int main(int argc, char* argv[]) {
                 return gizmo::run_chat_tui("",
                                            gizmo::join_colon_dirs(dirs),
                                            options.max_tokens,
-                                           options.threads.empty() ? 4 : options.threads[0]);
+                                           options.threads.empty() ? 4 : options.threads[0],
+                                           options.context_size);
             }
             return do_chat(options.model,
                            options.resident_layers.empty() ? 8 : options.resident_layers[0],
@@ -1083,6 +1425,7 @@ int main(int argc, char* argv[]) {
                            options.row_size.empty() ? 1 : options.row_size[0],
                            options.threads.empty() ? 4 : options.threads[0],
                            options.max_tokens,
+                           options.context_size,
                            options.measure_ram,
                            options.measure_interval_ms,
                            options.verbose,
@@ -1098,7 +1441,8 @@ int main(int argc, char* argv[]) {
                             options.resident_layers.empty() ? 8 : options.resident_layers[0],
                             options.no_evict,
                             options.row_size.empty() ? 1 : options.row_size[0],
-                            options.threads.empty() ? 4 : options.threads[0]);
+                            options.threads.empty() ? 4 : options.threads[0],
+                            options.context_size);
         }
 
         case gizmo::CommandType::Sweep: {
@@ -1130,7 +1474,8 @@ int main(int argc, char* argv[]) {
                                options.json_output,
                                options.argmax_only,
                                options.max_diff_threshold,
-                               options.mean_diff_threshold);
+                               options.mean_diff_threshold,
+                               options.context_size);
         }
 
         case gizmo::CommandType::Download: {
@@ -1155,6 +1500,7 @@ int main(int argc, char* argv[]) {
             settings.port = options.port;
             settings.threads = options.server_threads;
             settings.request_timeout_seconds = options.request_timeout_seconds;
+            settings.context_size = options.context_size;
             settings.log_file = options.log_file;
             settings.json_logs = options.json_logs;
             settings.cors = options.cors;
@@ -1181,6 +1527,7 @@ int main(int argc, char* argv[]) {
             settings.port = options.port;
             settings.threads = options.server_threads;
             settings.request_timeout_seconds = options.request_timeout_seconds;
+            settings.context_size = options.context_size;
             settings.log_file = options.log_file;
             settings.json_logs = options.json_logs;
             settings.cors = options.cors;
@@ -1190,6 +1537,21 @@ int main(int argc, char* argv[]) {
             settings.resident_layers = options.resident_layers.empty() ? 8 : options.resident_layers[0];
             settings.row_size = options.row_size.empty() ? 1 : options.row_size[0];
             return gizmo::run_server_headless(settings);
+        }
+
+        case gizmo::CommandType::Launch: {
+            if (options.model.empty()) {
+                std::cerr << "Error: --model required for launch\n"
+                          << "Usage: gizmo launch claude -m <model.gguf> [--port <N>]\n";
+                return 1;
+            }
+            if (options.launch_target.empty() || options.launch_target != "claude") {
+                std::cerr << "Error: launch target must be 'claude' (got: "
+                          << (options.launch_target.empty() ? "<empty>" : options.launch_target)
+                          << ")\n";
+                return 1;
+            }
+            return do_launch_claude(options);
         }
 
         case gizmo::CommandType::Run: {
@@ -1213,6 +1575,7 @@ int main(int argc, char* argv[]) {
             engine.set_verbose(options.verbose);
             engine.set_progress(options.progress);
             engine.set_threads(options.threads.empty() ? 4 : options.threads[0]);
+            engine.set_context_size(options.context_size);
             if (!engine.initialize(options.model, /*layer_shard_lazy=*/!options.no_shard)) {
                 std::cerr << "Failed to initialize inference engine\n";
                 return 1;
@@ -1240,6 +1603,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Total layers: " << n_layer << "\n";
             std::cout << "Embedding dim: " << engine.embedding_dim() << "\n";
             std::cout << "Vocab size: " << engine.vocab_size() << "\n";
+            std::cout << "Context size: " << llama_n_ctx(engine.raw_context()) << "\n";
 
             // Resident layer count for display only. Real per-block
             // residency control requires a custom forward pass; we keep

@@ -18,6 +18,7 @@ enum class CommandType {
     Server,   // alias for Serve; kept for backwards compatibility
     Serve,    // HTTP server (OpenAI-compatible API)
     Tui,      // interactive server launcher / dashboard
+    Launch,   // launch external tools pointed at the running API
     Help,
     Unknown
 };
@@ -60,6 +61,20 @@ struct CliOptions {
 
     // Default model search directories (colon-separated on CLI).
     std::string extra_model_dirs; // extra directories to scan for GGUFs
+
+    // Context window size. 0 means "derive from model metadata (capped) or
+    // fall back to 4096". Explicit values override the auto default.
+    int32_t context_size = 0;
+
+    // Launch subcommand (e.g. "claude" for `gizmo launch claude`).
+    std::string launch_target;
+
+    // Launch backend: "gizmo" (local GGUF server, default) or "rux"
+    // (disk-KV HuggingFace server).
+    std::string backend = "gizmo";
+
+    // Optional explicit path to the `rux` executable when backend=rux.
+    std::string rux_path;
 };
 
 class CliParser {

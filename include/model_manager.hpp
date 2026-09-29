@@ -17,6 +17,7 @@ struct ModelInfo {
     int32_t total_layers;
     int32_t embedding_dim;
     int32_t vocab_size;
+    int32_t context_length = 0;  // trained context window from GGUF metadata
 };
 
 class ModelManager {

@@ -1,5 +1,6 @@
 #include "model_manager.hpp"
 #include "gguf.h"
+#include <climits>
 #include <fstream>
 #include <sstream>
 #include <filesystem>
@@ -193,8 +194,42 @@ ModelInfo ModelManager::parse_gguf_header(const std::string& path) {
         info.parameter_count = read_int_meta(ctx, param_key);
     }
 
-    // Layer count: look for <arch>.block_count (e.g. qwen3.block_count).
+    // Total number of GGUF KV entries; reused by metadata scans below.
     const int64_t n_kv = gguf_get_n_kv(ctx);
+
+    // Context length: prefer the explicit top-level key, then llama.context_length,
+    // then <arch>.context_length. Store 0 if none are present.
+    const char* ctx_keys[] = {
+        "context_length",
+        "llama.context_length",
+        nullptr
+    };
+    for (int i = 0; ctx_keys[i]; ++i) {
+        const int64_t ctx_key = gguf_find_key(ctx, ctx_keys[i]);
+        if (ctx_key >= 0) {
+            int64_t v = read_int_meta(ctx, ctx_key);
+            if (v > 0) {
+                info.context_length = static_cast<int32_t>(
+                    v > INT32_MAX ? INT32_MAX : v);
+                break;
+            }
+        }
+    }
+    if (info.context_length == 0) {
+        for (int64_t i = 0; i < n_kv; ++i) {
+            const char* key = gguf_get_key(ctx, i);
+            if (std::strstr(key, ".context_length") != nullptr) {
+                int64_t v = read_int_meta(ctx, i);
+                if (v > 0) {
+                    info.context_length = static_cast<int32_t>(
+                        v > INT32_MAX ? INT32_MAX : v);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Layer count: look for <arch>.block_count (e.g. qwen3.block_count).
     for (int64_t i = 0; i < n_kv; ++i) {
         const char* key = gguf_get_key(ctx, i);
         if (std::strstr(key, ".block_count") != nullptr) {

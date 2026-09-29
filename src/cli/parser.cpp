@@ -1,4 +1,5 @@
 #include "cli_parser.hpp"
+#include <cstdint>
 #include <iostream>
 #include <cstdlib>
 #include <vector>
@@ -46,6 +47,7 @@ CommandType CliParser::parse_command(const std::string& cmd) const {
     if (cmd == "server") return CommandType::Server;
     if (cmd == "serve") return CommandType::Serve;
     if (cmd == "tui") return CommandType::Tui;
+    if (cmd == "launch") return CommandType::Launch;
     if (cmd == "help" || cmd == "--help" || cmd == "-h") return CommandType::Help;
     return CommandType::Unknown;
 }
@@ -142,6 +144,21 @@ void CliParser::parse_flags(CliOptions& options, int start_index, int argc, char
             if (i + 1 < argc) options.download_url = argv[++i];
         } else if (arg == "--model-path") {
             if (i + 1 < argc) options.extra_model_dirs = argv[++i];
+        } else if (arg == "--context-size" || arg == "-c") {
+            if (i + 1 < argc) {
+                options.context_size = std::atoi(argv[++i]);
+                if (options.context_size < 0) {
+                    options.context_size = 0;
+                }
+            }
+        } else if (arg == "--backend") {
+            if (i + 1 < argc) {
+                options.backend = argv[++i];
+            }
+        } else if (arg == "--rux-path") {
+            if (i + 1 < argc) {
+                options.rux_path = argv[++i];
+            }
         }
     }
 
@@ -166,7 +183,28 @@ CliOptions CliParser::parse(int argc, char* argv[]) {
     }
 
     options.command = parse_command(argv[1]);
-    parse_flags(options, 2, argc, argv);
+
+    // For `gizmo launch <target>`, the second positional argument is the
+    // launch target (e.g. "claude"). Remaining flags start at argv[3].
+    if (options.command == CommandType::Launch) {
+        if (argc >= 3) {
+            options.launch_target = argv[2];
+        }
+        parse_flags(options, 3, argc, argv);
+    } else {
+        parse_flags(options, 2, argc, argv);
+    }
+
+    // Environment fallback for context size only when the CLI did not set it.
+    if (options.context_size == 0) {
+        const char* env_ctx = std::getenv("GIZMO_CONTEXT_SIZE");
+        if (env_ctx && env_ctx[0] != '\0') {
+            long v = std::strtol(env_ctx, nullptr, 10);
+            if (v > 0 && v <= INT32_MAX) {
+                options.context_size = static_cast<int32_t>(v);
+            }
+        }
+    }
 
     // Apply command-specific defaults for list-valued flags.
     if (options.command == CommandType::Sweep) {
@@ -213,6 +251,7 @@ Commands:
   serve     Start HTTP server (OpenAI-compatible API)
   server    Alias for serve (backwards compatibility)
   tui       Launch interactive server dashboard (model picker + live dashboard)
+  launch    Launch an external tool connected to the local API (e.g. `launch claude`)
   help      Show this help message
 
 Options:
@@ -222,6 +261,12 @@ Options:
                                 Single value for normal commands (default: 8);
                                 comma-separated list for sweep (default: 1,4,8,16)
   -n, --max-tokens <N>          Maximum tokens to generate for run/chat (default: 128)
+  -c, --context-size <N>        Context window size in tokens. Default derives from
+                                model metadata (capped at 262144 / 256k) or 4096.
+                                Also read from GIZMO_CONTEXT_SIZE env var.
+      --backend <gizmo|rux>     Launch backend: gizmo (local GGUF, default) or rux
+                                (disk-KV HuggingFace server)
+      --rux-path <path>         Explicit path to the `rux` executable (backend=rux)
       --no-shard                Disable sharding; load full model (uses all RAM)
       --measure-ram             Print VmRSS to stderr during run/chat
       --measure-interval-ms N   VmRSS sample interval (default: 500)
@@ -282,6 +327,10 @@ Examples:
   gizmo serve -m model.gguf -r 4 --cors
   gizmo chat -m model.gguf -n 256
   gizmo chat --model-path ~/models
+  gizmo launch claude -m model.gguf --port 8080
+  gizmo launch claude -m model.gguf -c 32768
+  gizmo launch claude --backend rux -m Qwen/Qwen2.5-3B-Instruct --port 8000
+  gizmo launch claude --backend rux -m meta-llama/Llama-3.2-3B-Instruct -c 65536
 )";
 }
 

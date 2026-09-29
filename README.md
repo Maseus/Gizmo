@@ -27,10 +27,26 @@ gizmo run -m /path/to/model.gguf -p "Hello" --progress -n 4
 gizmo chat                     # interactive chat with model picker
 gizmo chat -m /path/to/model.gguf -n 64
 
+# Run the automated test suite (no model required; engine integration tests skip
+# gracefully unless GIZMO_TEST_MODEL is set to an existing GGUF).
+cd build
+ctest --output-on-failure
+
+# Run the engine integration tests against a real model
+GIZMO_TEST_MODEL=/path/to/model.gguf ctest --output-on-failure
+
 # Start the OpenAI-compatible HTTP server directly (requires -m)
 gizmo serve -m /path/to/model.gguf --cors --port 8080
 # Use --json-logs and --log-file for structured request logs
 gizmo serve -m /path/to/model.gguf --cors --json-logs --log-file /var/log/gizmo.log
+
+# Launch Claude Code connected to the local Gizmo API (GGUF backend)
+gizmo launch claude -m /path/to/model.gguf --port 8080
+gizmo launch claude -m /path/to/model.gguf -c 32768
+
+# Launch Claude Code connected to a Rux disk-KV backend (HuggingFace models)
+gizmo launch claude --backend rux -m Qwen/Qwen2.5-3B-Instruct --port 8000
+gizmo launch claude --backend rux -m meta-llama/Llama-3.2-3B-Instruct -c 262144
 
 # Launch the interactive server dashboard instead
 gizmo tui
@@ -45,7 +61,7 @@ gizmo chat --model-path ~/models:/data/ggufs
 - Reports **real** memory usage (`/proc/self/status:VmRSS` / `VmHWM`) at model load, during generation, and at end-of-run. Use `--measure-ram` to print periodic VmRSS samples to stderr while generation is running.
 - Builds the llama.cpp dependency as a static library so the `gizmo` binary is self-contained.
 - Implements a **per-block sharded inference engine** for **qwen3-family** and **qwen3.5-family** models. This engine builds a separate `ggml_cgraph` per transformer block, threads the residual/KV/recurrent state, and can evict each block's weights after use. Output matches the native `llama_decode` baseline exactly for both prefill and decode on supported architectures.
-- Automatically falls back to native `llama_decode` for unsupported architectures (e.g., qwen2/qwen2.5, qwen3next/qwen3vl, and all MoE variants), so those models still work correctly with `--no-shard`-equivalent behavior.
+- Detects unsupported architectures at load time (e.g., qwen2/qwen2.5, qwen3next/qwen3vl, and all MoE variants) and disables the sharded engine. Small unsupported models still fall back to native `llama_decode`, but Gizmo refuses to run a large unsupported model that would not fit in available RAM, preventing a silent full-model load from OOM-killing the machine.
 - Uses the model's built-in chat template in `gizmo chat` and in the `/v1/chat/completions` endpoint via `llama_chat_apply_template` when available.
 - Runs an **OpenAI-compatible HTTP server** with graceful shutdown (SIGINT/SIGTERM), per-request timeouts, a bounded generation queue (safe for single-user + Claude Code subagents), structured JSON request logs, and CORS for browser frontends.
 - Serves on all interfaces by default and prints LAN IP addresses in the interactive `tui` dashboard.
@@ -68,6 +84,7 @@ gizmo chat --model-path ~/models:/data/ggufs
 | `info`      | Show system memory info |
 | `serve`     | Start HTTP server (OpenAI-compatible API); requires `-m`. `server` is an alias |
 | `tui`       | Launch interactive server TUI (model picker + live dashboard) |
+| `launch`    | Start the local API and launch an external tool pointed at it (e.g. `launch claude`). Use `--backend rux` for disk-KV HuggingFace models |
 
 When no command is given, `gizmo` prints this help. Use `gizmo chat` for the interactive chat TUI, `gizmo serve -m <model>` for the non-interactive OpenAI-compatible HTTP server, and `gizmo tui` for the interactive server dashboard.
 
@@ -79,6 +96,7 @@ When no command is given, `gizmo` prints this help. Use `gizmo chat` for the int
 - `-K, --row-size <K|list>` — chain K blocks per `ggml_cgraph`. Single value for normal commands (default 1); comma-separated list for `sweep` (default `1,2,4`)
 - `-t, --threads <N|list>` — CPU threads for `llama_decode` and the sharded backend. Single value for normal commands (default 4); comma-separated list for `sweep` (default `4`)
 - `-n, --max-tokens <N>` — maximum tokens to generate for `run`/`chat` (default: 128)
+- `-c, --context-size <N>` — context window size in tokens. Default derives from model metadata (capped at 262144 / 256k). Also read from `GIZMO_CONTEXT_SIZE` environment variable. Use this to lower the window on small-RAM machines, or raise it beyond the model's trained length
 - `--no-shard` — disable the sharded engine and use plain `llama_decode`; the full model is prefaulted at load time
 - `--no-evict` — skip `madvise(MADV_DONTNEED)` after each block; keeps weights resident for faster generation at higher RSS
 - `--measure-ram` — print VmRSS to stderr every `--measure-interval-ms` ms during `run`/`chat`/`server`
@@ -99,6 +117,8 @@ When no command is given, `gizmo` prints this help. Use `gizmo chat` for the int
 - `--request-timeout <N>` — per-request generation timeout in seconds (default: 300)
 - `--log-file <path>` — append structured JSON request logs to a file
 - `--json-logs` — also emit structured JSON request logs to stderr
+- `--backend <gizmo|rux>` — launch backend for `gizmo launch claude` (default: gizmo)
+- `--rux-path <path>` — explicit path to the `rux` executable when using `--backend rux`
 - `-h, --help` — help
 - `--model-path <path[:path]>` — extra directories to scan for GGUF models. Also read from `GIZMO_MODEL_PATH` environment variable
 
@@ -201,7 +221,7 @@ The `sweep` command runs a full `generate()` for each `(threads, resident_layers
 
 ## Model support notes
 
-The sharded engine is implemented and validated for **qwen3-family full-attention** and **qwen3.5-family hybrid** (full-attention + gated-delta-net recurrent) models, including **Qwen3.8-27B**. Unsupported architectures, including **qwen2 / qwen2.5**, **qwen3next / qwen3vl**, and MoE variants (`qwen3moe`, `qwen35moe`, `qwen3vlmoe`), are detected at load time and the sharded engine is disabled automatically, falling back to native `llama_decode` so you still get correct output. Use `--no-shard` explicitly if you want to force the un-sharded path.
+The sharded engine is implemented and validated for **qwen3-family full-attention** and **qwen3.5-family hybrid** (full-attention + gated-delta-net recurrent) models, including **Qwen3.8-27B**. Unsupported architectures, including **qwen2 / qwen2.5**, **qwen3next / qwen3vl**, and MoE variants (`qwen3moe`, `qwen35moe`, `qwen3vlmoe`), are detected at load time and the sharded engine is disabled. Small unsupported models still fall back to native `llama_decode`, but Gizmo refuses to decode a large unsupported model that would not fit in available RAM, preventing a silent full-model load from OOM-killing the host. Use `--no-shard` explicitly if you want to force the un-sharded path (the RAM guard still applies).
 
 > **Memory tip for Qwen3.8-27B on 16 GB hosts:** use `-r 1` to keep only one block resident at a time. A default `-r 8` run can exceed 12 GB resident and may make the host unresponsive.
 
@@ -236,13 +256,31 @@ gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080 --cors --request-t
 # Emit JSON request logs to stderr and a file
 gizmo serve -m /path/to/model.gguf --json-logs --log-file /var/log/gizmo.log
 
-# Test the endpoints
+# Launch Claude Code with this backend (auto-sets OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL)
+gizmo launch claude -m /path/to/model.gguf --port 8080
+
+# Test the endpoints manually
 curl http://127.0.0.1:8080/v1/health
 curl http://127.0.0.1:8080/v1/models
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":16}'
 ```
+
+### Claude Code
+
+`gizmo launch claude -m <model>` starts a local OpenAI-compatible server, waits for `/v1/health`, then launches the Claude Code CLI pointed at it. It sets `OPENAI_BASE_URL=http://<host>:<port>/v1`, `OPENAI_API_KEY=gizmo`, and `OPENAI_MODEL=<model-id>`. If the `claude` (or `claude-code` / `claude-desktop`) binary is not found, Gizmo prints the same connection settings and keeps the server running so you can paste them into another terminal. The server stops automatically when Claude Code exits.
+
+#### Rux disk-KV backend
+
+For very long contexts on modest RAM, use `--backend rux` to launch [Rux](https://github.com/Maseus/Rux) instead of Gizmo's native GGUF server. Rux keeps the attention KV cache on disk and streams it back in chunks, so a 256K context costs disk space rather than RAM. The model argument is a HuggingFace model id (e.g. `Qwen/Qwen2.5-3B-Instruct`) that Rux has already downloaded.
+
+```bash
+gizmo launch claude --backend rux -m Qwen/Qwen2.5-3B-Instruct --port 8000
+gizmo launch claude --backend rux -m meta-llama/Llama-3.2-3B-Instruct -c 262144
+```
+
+Use `--rux-path /path/to/rux` if `rux` is not on PATH. Gizmo will also look in the common Rux venv location (`~/Desktop/Rux/Rux/venv/bin/rux`).
 
 ### Docker
 

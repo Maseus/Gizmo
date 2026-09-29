@@ -237,6 +237,7 @@ struct ServeSettingsState {
     std::string host = "0.0.0.0";
     int port = 8080;
     int request_timeout_seconds = 300;
+    int context_size = 0;
     bool cors = false;
     bool no_evict = false;
     bool verbose = false;
@@ -248,6 +249,7 @@ enum class SettingsField : int {
     Host,
     Port,
     RequestTimeout,
+    ContextSize,
     Cors,
     NoEvict,
     Verbose,
@@ -278,6 +280,7 @@ ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
             case SettingsField::Host:           return "Host";
             case SettingsField::Port:           return "Port";
             case SettingsField::RequestTimeout: return "Request timeout (seconds)";
+            case SettingsField::ContextSize:    return "Context size (0 = auto)";
             case SettingsField::Cors:           return "CORS";
             case SettingsField::NoEvict:        return "Keep weights resident (no eviction)";
             case SettingsField::Verbose:        return "Verbose sharded-engine output";
@@ -292,6 +295,7 @@ ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
             case SettingsField::Host:           return st.host;
             case SettingsField::Port:           return std::to_string(st.port);
             case SettingsField::RequestTimeout: return std::to_string(st.request_timeout_seconds);
+            case SettingsField::ContextSize:    return std::to_string(st.context_size);
             case SettingsField::Cors:           return st.cors ? "on" : "off";
             case SettingsField::NoEvict:        return st.no_evict ? "on" : "off";
             case SettingsField::Verbose:        return st.verbose ? "on" : "off";
@@ -341,6 +345,10 @@ ServeSettingsState edit_settings_interactive(const ServeSettingsState& seed) {
             char* end = nullptr;
             long v = std::strtol(edit_buffer.c_str(), &end, 10);
             if (end != edit_buffer.c_str() && v > 0 && v <= 86400) st.request_timeout_seconds = static_cast<int>(v);
+        } else if (f == SettingsField::ContextSize) {
+            char* end = nullptr;
+            long v = std::strtol(edit_buffer.c_str(), &end, 10);
+            if (end != edit_buffer.c_str() && v >= 0 && v <= 1048576) st.context_size = static_cast<int>(v);
         } else if (f == SettingsField::Threads) {
             char* end = nullptr;
             long v = std::strtol(edit_buffer.c_str(), &end, 10);
@@ -459,6 +467,7 @@ public:
         st.host = settings_.host;
         st.port = settings_.port;
         st.request_timeout_seconds = settings_.request_timeout_seconds;
+        st.context_size = settings_.context_size;
         st.cors = settings_.cors;
         st.no_evict = settings_.no_evict;
         st.verbose = settings_.verbose;
@@ -480,6 +489,7 @@ private:
         InferenceEngine engine;
         engine.set_verbose(st.verbose);
         engine.set_threads(st.threads);
+        engine.set_context_size(st.context_size);
 
         clear_screen();
         std::cout << "\x1b[1;36mGizmo Server\x1b[0m\n";
@@ -626,6 +636,7 @@ int serve_headless(const ServeSettings& settings) {
     InferenceEngine engine;
     engine.set_verbose(settings.verbose);
     engine.set_threads(settings.threads);
+    engine.set_context_size(settings.context_size);
 
     std::cout << "Loading model: " << model_path << "\n";
     if (!engine.initialize(model_path, /*layer_shard_lazy=*/!settings.no_shard)) {

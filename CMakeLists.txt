@@ -38,9 +38,9 @@ endif()
 add_subdirectory(tools/one_block_spike)
 add_subdirectory(tools/sharded_engine)
 
-# Gizmo executable
-add_executable(gizmo
-    src/main.cpp
+# Core library shared by the gizmo binary and the test runner.
+# src/main.cpp is excluded because it defines the executable entry point.
+add_library(gizmo_core STATIC
     src/cli/parser.cpp
     src/model/manager.cpp
     src/inference/engine.cpp
@@ -54,34 +54,42 @@ add_executable(gizmo
     src/ui/chat_tui.cpp
 )
 
-target_include_directories(gizmo PRIVATE
+target_include_directories(gizmo_core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/third_party
 )
 
 # Link llama.cpp libraries if available
 if(EXISTS "${CMAKE_SOURCE_DIR}/llama.cpp/CMakeLists.txt")
-    target_link_libraries(gizmo PRIVATE
+    target_link_libraries(gizmo_core PUBLIC
         llama
     )
 else()
     # Stub build - no llama.cpp yet
-    target_compile_definitions(gizmo PRIVATE GIZMO_STUB_MODE)
+    target_compile_definitions(gizmo_core PUBLIC GIZMO_STUB_MODE)
 endif()
 
-# Wire the sharded inference engine into gizmo. gizmo_sharded_engine_core
+# Wire the sharded inference engine into the core library. gizmo_sharded_engine_core
 # is a static lib whose PUBLIC link interface pulls in llama and the
 # llama.cpp/ggml include dirs. We also need to add the sharded engine
-# headers to gizmo's include path so the engine can include multi_block.h.
+# headers to the include path so the engine can include multi_block.h.
 if(TARGET gizmo_sharded_engine_core)
-    target_link_libraries(gizmo PRIVATE gizmo_sharded_engine_core)
-    target_include_directories(gizmo PRIVATE
+    target_link_libraries(gizmo_core PUBLIC gizmo_sharded_engine_core)
+    target_include_directories(gizmo_core PUBLIC
         ${CMAKE_SOURCE_DIR}/tools/sharded_engine
     )
 endif()
 
+# Gizmo executable
+add_executable(gizmo src/main.cpp)
+target_link_libraries(gizmo PRIVATE gizmo_core)
+
 # Install target
 install(TARGETS gizmo RUNTIME DESTINATION bin)
+
+# Automated tests
+enable_testing()
+add_subdirectory(tests)
 
 # Packaging
 set(CPACK_PACKAGE_NAME "gizmo")

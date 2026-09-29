@@ -39,6 +39,9 @@ cmake --build build -j$(nproc)
 # Run with bounded tokens and measure RAM
 ./build/gizmo run -m /path/to/model.gguf -p "Hello!" -r 1 -n 4 --measure-ram
 
+# Override the context window (default is model-derived, capped at 262144 / 256k)
+./build/gizmo run -m /path/to/model.gguf -p "Hello!" --context-size 32768
+
 # Show an in-place block/token progress indicator during prefill/decode (TTY only)
 ./build/gizmo run -m /path/to/model.gguf -p "Hello!" -r 1 -n 16 --progress
 
@@ -73,6 +76,14 @@ cmake --build build -j$(nproc)
 # Production-style serving with structured logs and a 60 s timeout
 ./build/gizmo serve -m /path/to/model.gguf --host 0.0.0.0 --port 8080 \
   --cors --request-timeout 60 --json-logs --log-file /tmp/gizmo.log
+
+# Launch Claude Code connected to a local Gizmo backend (GGUF)
+./build/gizmo launch claude -m /path/to/model.gguf --port 8080
+./build/gizmo launch claude -m /path/to/model.gguf -c 32768
+
+# Launch Claude Code connected to a Rux disk-KV backend (HuggingFace)
+./build/gizmo launch claude --backend rux -m Qwen/Qwen2.5-3B-Instruct --port 8000
+./build/gizmo launch claude --backend rux -m meta-llama/Llama-3.2-3B-Instruct -c 262144
 
 curl http://127.0.0.1:8080/v1/health
 curl http://127.0.0.1:8080/v1/models

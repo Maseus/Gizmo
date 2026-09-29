@@ -1,14 +1,20 @@
 #include "inference_engine.hpp"
+#include "context_validation.hpp"
 #include "proc_status.hpp"
 #include "tokenizer.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/sysinfo.h>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -61,7 +67,147 @@ bool is_sharded_arch_supported(const llama_model* model) {
     }
 }
 
+// Forward declaration; the helpers are defined below.
+static int64_t get_available_ram_bytes();
+
+// Compute a rough KV-cache size for a given context length.
+// KV cells hold K and V for each layer. The exact format depends on the model
+// (flash-attn, recurrent state, etc.), so this is intentionally conservative.
+static int64_t estimate_kv_cache_bytes(const llama_model* model, int32_t n_ctx) {
+    if (model == nullptr) return 0;
+    const int32_t n_layer = llama_model_n_layer(model);
+    const int32_t n_embd  = llama_model_n_embd(model);
+    const int32_t n_head_kv = llama_model_n_head_kv(model);
+    // K/V per token per layer: 2 tensors × (n_embd / n_head) × n_head_kv
+    // Use a 2-byte-per-element estimate (fp16/bf16/q8_0-ish) plus a 20%
+    // overhead for alignment / flash-attn buffers / recurrent state.
+    int64_t bytes_per_cell = static_cast<int64_t>(2) * n_layer * (n_embd / n_head_kv) * n_head_kv * 2;
+    bytes_per_cell += bytes_per_cell / 5;
+    return bytes_per_cell * n_ctx;
+}
+
+// Default context size to use when the caller did not request an explicit
+// value. Prefer the model's trained context length, but cap it to avoid
+// accidentally allocating an enormous KV cache on small-RAM machines. A 128k
+// context for an 8B model needs tens of GB of KV cache, which would OOM a
+// typical laptop. Users who really want the full window can pass
+// --context-size explicitly.
+int32_t default_context_size_for_model(const llama_model* model) {
+    if (model == nullptr) {
+        return 4096;
+    }
+    const int32_t model_ctx = llama_model_n_ctx_train(model);
+    if (model_ctx <= 0) {
+        return 4096;
+    }
+    // Never exceed the model's trained length by default.
+    const int32_t kModelMax = model_ctx;
+
+    int64_t available = get_available_ram_bytes();
+    if (available <= 0) {
+        // Cannot read RAM: be conservative.
+        constexpr int32_t kSafeFallback = 8192;
+        return kModelMax < kSafeFallback ? kModelMax : kSafeFallback;
+    }
+
+    // Reserve working memory for the OS, the model weights that get faulted in,
+    // activations, and the compute graph. On a 14 GB machine we aim to keep the
+    // KV cache under roughly 50% of available RAM so a large model still loads
+    // and runs without swapping.
+    const int64_t kv_budget = available / 2;
+
+    int32_t best_ctx = 4096;
+    // Binary-search the largest context length whose estimated KV cache fits.
+    int32_t lo = 4096;
+    int32_t hi = kModelMax;
+    while (lo <= hi) {
+        int32_t mid = lo + (hi - lo) / 2;
+        if (estimate_kv_cache_bytes(model, mid) <= kv_budget) {
+            best_ctx = mid;
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    // Round down to a multiple of 1024 for cleaner reporting and to avoid
+    // landing exactly on an awkward KV-cache boundary.
+    best_ctx = (best_ctx / 1024) * 1024;
+    if (best_ctx < 4096) best_ctx = 4096;
+    return best_ctx;
+}
+
+// Read the amount of memory Linux reports as available for new allocations
+// without swapping (MemAvailable from /proc/meminfo). Returns -1 if the value
+// cannot be read.
+static int64_t read_meminfo_available_bytes() {
+    std::ifstream f("/proc/meminfo");
+    if (!f) return -1;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("MemAvailable:", 0) == 0) {
+            long kb = 0;
+            if (std::sscanf(line.c_str(), "MemAvailable: %ld kB", &kb) == 1) {
+                return static_cast<int64_t>(kb) * 1024;
+            }
+        }
+    }
+    return -1;
+}
+
+// Total system memory from sysinfo (used as a fallback when /proc/meminfo is
+// unreadable).
+static int64_t read_sysinfo_total_bytes() {
+    struct sysinfo si;
+    if (sysinfo(&si) != 0) return -1;
+    return static_cast<int64_t>(si.totalram) * si.mem_unit;
+}
+
+// Wrapper used by context sizing (defined above) and the RAM guard below.
+static int64_t get_available_ram_bytes() {
+    int64_t v = read_meminfo_available_bytes();
+    if (v < 0) v = read_sysinfo_total_bytes();
+    return v;
+}
+
 } // namespace
+
+bool InferenceEngine::can_run_unsharded_safely() const {
+    if (!initialized_ || llama_model_ == nullptr || model_path_.empty()) {
+        return false;
+    }
+
+    // If the model architecture is supported by the sharded engine, the
+    // per-block path is preferred; the caller decides whether to enable it.
+    if (is_sharded_arch_supported(llama_model_)) {
+        return true;
+    }
+
+    struct stat st;
+    if (stat(model_path_.c_str(), &st) != 0) {
+        // Cannot determine the model's size; be conservative and allow the
+        // run so the caller sees a normal load error rather than a guard hit.
+        return true;
+    }
+    const int64_t model_bytes = static_cast<int64_t>(st.st_size);
+
+    int64_t available = get_available_ram_bytes();
+    if (available <= 0) {
+        return true;
+    }
+
+    // Leave 5% headroom for the OS, the llama context, and activations.
+    const int64_t usable = available - (available / 20);
+    if (model_bytes > usable) {
+        if (verbose_) {
+            std::cerr << "Refusing unsharded inference: model file is "
+                      << (model_bytes / (1024 * 1024)) << " MB but only "
+                      << (available / (1024 * 1024))
+                      << " MB of RAM is available (need sharded engine).\n";
+        }
+        return false;
+    }
+    return true;
+}
 
 InferenceEngine::InferenceEngine()
     : initialized_(false)
@@ -178,8 +324,18 @@ bool InferenceEngine::initialize(const std::string& model_path, bool layer_shard
         std::cout << "Vocab size: " << llama_vocab_n_tokens(vocab) << "\n";
     }
 
+    // Derive the context window. If the caller did not set an explicit size,
+    // ask the model for its trained length and cap it to a RAM-safe default.
+    const int32_t effective_context_size =
+        context_size_ > 0 ? context_size_ : default_context_size_for_model(llama_model_);
+    if (verbose_) {
+        std::cout << "Context size: " << effective_context_size
+                  << " (" << (context_size_ > 0 ? "explicit" : "model-derived")
+                  << ")\n";
+    }
+
     struct llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = context_size_ > 0 ? context_size_ : 4096;
+    ctx_params.n_ctx = effective_context_size;
     ctx_params.n_batch = 512;
     ctx_params.n_ubatch = 512;
     ctx_params.n_threads = sharded_n_threads_;
@@ -296,10 +452,11 @@ static int do_prefill(
     const int n_vocab = (int)llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     // Reject prompts that do not fit in the KV cache before any decode work.
+    // The prompt must leave at least one slot for the first generated token.
     const int32_t n_ctx = static_cast<int32_t>(llama_n_ctx(ctx));
     if (n_tokens >= n_ctx) {
         std::cerr << "Error: Prompt too long (" << n_tokens
-                  << " tokens, context size " << n_ctx << ")\n";
+                  << " tokens, context size " << n_ctx << "; need at least 1 free slot)\n";
         return -1;
     }
 
@@ -516,14 +673,27 @@ bool InferenceEngine::generate_stream(
 
     // Honor per-request context-size requests when validating the prompt and
     // rebuilding the context.  Reject early if the prompt does not fit in the
-    // requested (or current) context window.
+    // requested (or current) context window, and clamp max_tokens so the decode
+    // loop never overflows the KV cache.
     const int32_t n_ctx_current = static_cast<int32_t>(llama_n_ctx(llama_context_));
     const int32_t n_ctx_effective =
         config.context_size > 0 ? config.context_size : n_ctx_current;
-    if (n_tokens >= n_ctx_effective) {
+    if (!prompt_fits_context(n_tokens, n_ctx_effective)) {
         std::cerr << "Error: Prompt is too long (" << n_tokens
                   << " tokens, context size " << n_ctx_effective << ")\n";
         return false;
+    }
+
+    int32_t n_predict = clamp_generation_length(n_tokens, n_ctx_effective, config.max_tokens);
+    if (n_predict <= 0) {
+        std::cerr << "Error: No room for generation (prompt " << n_tokens
+                  << " tokens, context size " << n_ctx_effective << ")\n";
+        return false;
+    }
+    if (verbose_ && config.max_tokens > n_predict) {
+        std::cout << "Warning: max_tokens (" << config.max_tokens
+                  << ") exceeds remaining context slots (" << (n_ctx_effective - n_tokens)
+                  << "); clamping generation to fit.\n";
     }
 
     if (config.context_size > 0 && n_ctx_current != config.context_size) {
@@ -541,6 +711,19 @@ bool InferenceEngine::generate_stream(
                       << config.context_size << "\n";
             return false;
         }
+        // Persist the requested context size so subsequent calls that do not
+        // pass config.context_size see the new size as the current context.
+        context_size_ = config.context_size;
+    }
+
+    // RAM guard: if we are about to run the un-sharded llama_decode path on an
+    // unsupported model, make sure the full weights fit in RAM. Otherwise the
+    // first decode would page in the entire GGUF and OOM the machine.
+    if (!use_sharded_engine_ && !can_run_unsharded_safely()) {
+        std::cerr << "Error: Model is too large to run without the sharded engine on this system.\n"
+                  << "Use a supported architecture (qwen3/qwen3.5), a smaller model, "
+                  << "or a machine with more RAM.\n";
+        return false;
     }
 
     // Build the sampler chain in the order llama.cpp expects:
@@ -582,7 +765,6 @@ bool InferenceEngine::generate_stream(
     last_sharded_prefill_rss_ = sharded_rss;
     last_sharded_prefill_hwm_ = sharded_hwm;
 
-    int32_t n_predict = config.max_tokens;
     int32_t n_cur = 0;
     int32_t n_past = n_tokens;  // KV cache already holds the prompt
     std::string generated_text;
@@ -736,8 +918,15 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
     const int32_t n_ctx_current = static_cast<int32_t>(llama_n_ctx(llama_context_));
     const int32_t n_ctx_effective =
         config.context_size > 0 ? config.context_size : n_ctx_current;
-    if (n_tokens >= n_ctx_effective) {
+    if (!prompt_fits_context(n_tokens, n_ctx_effective)) {
         std::cerr << "Error: Context is too long (" << n_tokens
+                  << " tokens, context size " << n_ctx_effective << "; need at least 1 free slot)\n";
+        return result;
+    }
+    if (n_tokens + 1 > n_ctx_effective) {
+        // Defensive: covered by prompt_fits_context(), kept for parity with
+        // the single-token API contract.
+        std::cerr << "Error: No room to generate a token (prompt " << n_tokens
                   << " tokens, context size " << n_ctx_effective << ")\n";
         return result;
     }
@@ -758,6 +947,16 @@ TokenResult InferenceEngine::generate_token(const std::string& context, const In
                       << config.context_size << "\n";
             return result;
         }
+        context_size_ = config.context_size;
+    }
+
+    // RAM guard: avoid paging in a full unsupported model when we are not
+    // running through the sharded engine.
+    if (!use_sharded_engine_ && !can_run_unsharded_safely()) {
+        std::cerr << "Error: Model is too large to run without the sharded engine on this system.\n"
+                  << "Use a supported architecture (qwen3/qwen3.5), a smaller model, "
+                  << "or a machine with more RAM.\n";
+        return result;
     }
 
     if (do_prefill(llama_context_, (const llama_model*)llama_model_,
@@ -813,6 +1012,54 @@ int InferenceEngine::prefill_only(const std::string& prompt) {
     return prefill_only_tokens(tokens.data(), n_tokens);
 }
 
+// Validate that `n_tokens` fits in the current context window and rebuild the
+// context if a per-request context size was requested.
+static bool ensure_context_fits_and_rebuild(
+    llama_model* model,
+    llama_context*& ctx,
+    int32_t& ctx_size_member,
+    int32_t requested_ctx_size,
+    int32_t n_tokens,
+    int32_t threads,
+    const char* caller
+) {
+    const int32_t n_ctx_current = ctx ? static_cast<int32_t>(llama_n_ctx(ctx)) : 0;
+    const int32_t n_ctx_effective =
+        requested_ctx_size > 0 ? requested_ctx_size : n_ctx_current;
+
+    if (n_ctx_effective <= 0) {
+        std::cerr << caller << ": context not initialized\n";
+        return false;
+    }
+
+    if (n_tokens >= n_ctx_effective) {
+        std::cerr << "Error: " << caller << ": prompt too long (" << n_tokens
+                  << " tokens, context size " << n_ctx_effective
+                  << "; need at least 1 free slot)\n";
+        return false;
+    }
+
+    if (requested_ctx_size > 0 && n_ctx_current != requested_ctx_size) {
+        llama_free(ctx);
+        ctx = nullptr;
+        struct llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = requested_ctx_size;
+        ctx_params.n_batch = 512;
+        ctx_params.n_ubatch = 512;
+        ctx_params.n_threads = threads;
+        ctx_params.n_threads_batch = threads;
+        ctx = llama_init_from_model(model, ctx_params);
+        if (ctx == nullptr) {
+            std::cerr << "Error: " << caller
+                      << ": failed to recreate llama context for context_size="
+                      << requested_ctx_size << "\n";
+            return false;
+        }
+        ctx_size_member = requested_ctx_size;
+    }
+    return true;
+}
+
 int InferenceEngine::prefill_only_tokens(const llama_token* tokens, int32_t n_tokens) {
     if (!initialized_ || llama_context_ == nullptr) {
         return -1;
@@ -820,6 +1067,11 @@ int InferenceEngine::prefill_only_tokens(const llama_token* tokens, int32_t n_to
     if (sharded_sched_ == nullptr) {
         std::cerr << "prefill_only_tokens: sharded engine not enabled; "
                      "call enable_sharded_engine() first\n";
+        return -1;
+    }
+    if (!ensure_context_fits_and_rebuild(
+            llama_model_, llama_context_, context_size_, /*requested_ctx_size=*/0,
+            n_tokens, sharded_n_threads_, "prefill_only_tokens")) {
         return -1;
     }
     // prefill_unsharded=false: skip the un-sharded prefill so the
@@ -857,47 +1109,44 @@ int InferenceEngine::validate_prefill(
         return -1;
     }
 
+    if (!ensure_context_fits_and_rebuild(
+            llama_model_, llama_context_, context_size_, /*requested_ctx_size=*/0,
+            n_tokens, sharded_n_threads_, "validate_prefill")) {
+        return -1;
+    }
+
     const int n_vocab = (int)llama_vocab_n_tokens(vocab);
     out_logits.assign((size_t)n_vocab, 0.0f);
 
-    if (sharded_sched_ != nullptr) {
-        // Sharded path: run the per-block engine and copy its last-token
-        // logits back to the caller. Skip the un-sharded fallback.
-        if (do_prefill(llama_context_, (const llama_model*)llama_model_,
-                       sharded_sched_, tokens.data(), n_tokens,
-                       sharded_evict_weights_, sharded_resident_layers_,
-                       sharded_row_size_,
-                       nullptr, nullptr,
-                       /*prefill_unsharded=*/false, verbose_, progress_) != 0) {
-            return -1;
+    // Validate deliberately exercises both paths. If the un-sharded baseline
+    // would page in a model that does not fit in RAM, refuse it rather than
+    // OOM the comparison.
+    if (sharded_sched_ == nullptr && !can_run_unsharded_safely()) {
+        if (verbose_) {
+            std::cerr << "validate_prefill: refusing unsharded baseline; "
+                         "model does not fit in available RAM\n";
         }
-        // do_prefill already copied sharded last-token logits into
-        // llama_context_'s output buffer when sharded_sched_ is non-null.
-        const float* buf = llama_get_logits(llama_context_);
-        if (buf == nullptr) {
-            return -1;
-        }
-        std::memcpy(out_logits.data(), buf, (size_t)n_vocab * sizeof(float));
-    } else {
-        // Un-sharded baseline path: run native llama_decode and read the
-        // last-token logits directly. The caller must load the model with
-        // --no-shard (layer_shard_lazy=false) to use this branch.
-        if (llama_decode(llama_context_, llama_batch_get_one(tokens.data(), n_tokens)) != 0) {
-            if (verbose_) {
-                std::cerr << "validate_prefill: llama_decode failed\n";
-            }
-            return -1;
-        }
-        const float* logits = llama_get_logits(llama_context_);
-        if (logits == nullptr) {
-            return -1;
-        }
-        // llama_batch_get_one leaves batch.logits == nullptr, which tells
-        // llama_decode to compute logits for the last token only. The
-        // returned buffer is therefore just n_vocab floats.
-        std::memcpy(out_logits.data(), logits, (size_t)n_vocab * sizeof(float));
+        return -1;
     }
 
+    // Run the prefill through do_prefill. It handles both sharded and un-sharded
+    // paths, chunks long prompts to respect n_batch on the un-sharded path, and
+    // copies sharded last-token logits into llama_context_'s output buffer.
+    if (do_prefill(llama_context_, (const llama_model*)llama_model_,
+                   sharded_sched_, tokens.data(), n_tokens,
+                   sharded_evict_weights_, sharded_resident_layers_,
+                   sharded_row_size_,
+                   nullptr, nullptr,
+                   /*prefill_unsharded=*/sharded_sched_ == nullptr,
+                   verbose_, progress_) != 0) {
+        return -1;
+    }
+
+    const float* buf = llama_get_logits(llama_context_);
+    if (buf == nullptr) {
+        return -1;
+    }
+    std::memcpy(out_logits.data(), buf, (size_t)n_vocab * sizeof(float));
     return 0;
 }
 
@@ -944,6 +1193,11 @@ int32_t InferenceEngine::embedding_dim() const {
 int32_t InferenceEngine::vocab_size() const {
     if (llama_model_ == nullptr) return 0;
     return llama_vocab_n_tokens(llama_model_get_vocab(llama_model_));
+}
+
+int32_t InferenceEngine::context_size() const {
+    if (llama_context_ == nullptr) return 0;
+    return static_cast<int32_t>(llama_n_ctx(llama_context_));
 }
 
 } // namespace gizmo

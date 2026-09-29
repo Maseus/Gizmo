@@ -45,7 +45,8 @@ std::string ask_custom_path() {
 int run_chat_tui(const std::string& model_path,
                  const std::string& model_path_extra,
                  int32_t max_tokens,
-                 int32_t threads) {
+                 int32_t threads,
+                 int32_t context_size) {
     const bool is_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
 
     // Resolve model path.
@@ -82,6 +83,7 @@ int run_chat_tui(const std::string& model_path,
     // Load engine with a low-memory default profile.
     InferenceEngine engine;
     engine.set_threads(threads > 0 ? threads : 4);
+    engine.set_context_size(context_size);
     if (!engine.initialize(path, /*layer_shard_lazy=*/true)) {
         std::cerr << "Failed to initialize inference engine for: " << path << "\n";
         return 1;
@@ -103,6 +105,7 @@ int run_chat_tui(const std::string& model_path,
     InferenceConfig cfg;
     cfg.max_tokens = max_tokens > 0 ? max_tokens : 128;
     cfg.temperature = 0.8f;
+    cfg.context_size = context_size;
 
     if (!is_tty) {
         // Non-TTY fallback: simple line-based chat (same as gizmo chat).

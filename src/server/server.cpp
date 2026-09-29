@@ -522,6 +522,9 @@ void HttpServer::handle_models(const httplib::Request& req, httplib::Response& r
     model_info["object"] = "model";
     model_info["created"] = static_cast<int64_t>(std::time(nullptr));
     model_info["owned_by"] = "gizmo";
+    // Many OpenAI-compatible UIs (Hermes, OpenWebUI, etc.) read the context
+    // length from a non-standard field in the models list.
+    model_info["max_context_tokens"] = engine_.context_size();
 
     response["object"] = "list";
     response["data"] = {model_info};

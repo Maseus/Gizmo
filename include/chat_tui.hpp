@@ -13,7 +13,8 @@ namespace gizmo {
 int run_chat_tui(const std::string& model_path,
                  const std::string& model_path_extra,
                  int32_t max_tokens,
-                 int32_t threads);
+                 int32_t threads,
+                 int32_t context_size);
 
 } // namespace gizmo
 

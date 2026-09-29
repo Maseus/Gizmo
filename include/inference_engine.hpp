@@ -13,7 +13,7 @@
 namespace gizmo {
 
 struct InferenceConfig {
-    int32_t context_size = 4096;
+    int32_t context_size = 0;   // 0 = use the engine's configured/default context size
     int32_t max_tokens = 256;
     float temperature = 0.8f;
     float top_p = 0.95f;
@@ -154,6 +154,9 @@ public:
     int32_t embedding_dim()  const;
     int32_t vocab_size()     const;
 
+    // Effective context window of the loaded llama context.
+    int32_t context_size()   const;
+
     // Sharding status (for diagnostics / --measure-ram).
     bool is_sharded() const { return use_sharded_engine_; }
 
@@ -175,12 +178,16 @@ public:
     }
 
 private:
+    // Returns true if the model can safely run without the sharded
+    // engine on this machine. Large unsupported models are rejected to
+    // avoid silent OOM from loading full weights into RAM.
+    bool can_run_unsharded_safely() const;
     bool initialized_;
     std::string model_path_;
     int32_t layers_loaded_;
     llama_context* llama_context_;
     llama_model*   llama_model_;
-    int32_t        context_size_ = 4096;
+    int32_t        context_size_ = 0;  // 0 = derive from model metadata (capped) or 4096
 
     // Sharded-engine state. Built in enable_sharded_engine(), freed
     // in the destructor. Both pointers may be null when the un-sharded
